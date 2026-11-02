@@ -52,3 +52,28 @@ defined('BASEPATH') OR exit('No direct script access allowed');
 $route['default_controller'] = 'welcome';
 $route['404_override'] = '';
 $route['translate_uri_dashes'] = FALSE;
+
+/*
+| -------------------------------------------------------------------------
+| API ROUTES (WhatsApp-like Chat Backend)
+| -------------------------------------------------------------------------
+*/
+$route['api/install']              = 'api/install';
+$route['api/register']             = 'api/register';
+$route['api/login']                = 'api/login';
+$route['api/logout']               = 'api/logout';
+$route['api/forgot_password']      = 'api/forgot_password';
+$route['api/profile']              = 'api/profile';
+$route['api/update_profile']       = 'api/update_profile';
+$route['api/update_profile_image'] = 'api/update_profile_image';
+$route['api/save_token']           = 'api/save_token';
+$route['api/users']                = 'api/users';
+$route['api/conversations']        = 'api/conversations';
+$route['api/messages']             = 'api/messages';
+$route['api/send_message']         = 'api/send_message';
+$route['api/send_media']           = 'api/send_media';
+$route['api/mark_read']            = 'api/mark_read';
+$route['api/heartbeat']            = 'api/heartbeat';
+$route['api/user_status']          = 'api/user_status';
+$route['api/(:any)']               = 'api/$1';
+
