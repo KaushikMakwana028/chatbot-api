@@ -1,5 +1,5 @@
 <?php
-defined('BASEPATH') OR exit('No direct script access allowed');
+defined('BASEPATH') or exit('No direct script access allowed');
 
 // Ensure Composer autoload is loaded if present
 if (file_exists(FCPATH . 'vendor/autoload.php')) {
@@ -44,7 +44,8 @@ class Api extends CI_Controller
     // Cryptographically secure 256-bit (32-byte / 64-hex) secret key for HS256 JWT tokens.
     // Can also be set/overridden in production via the JWT_SECRET environment variable.
     const JWT_SECRET               = 'f26f33cb5fcdf5eb5c0a14b296f9622639cf9ebcfb13c5ea9d3cc9d9a3ffd9a7';
-    const JWT_EXPIRY_DAYS          = 30;
+    // Permanent session: 100 years expiry (36500 days) so users stay permanently logged in like WhatsApp/Telegram
+    const JWT_EXPIRY_DAYS          = 36500;
     const FCM_PROJECT_ID           = 'chat-app-test-4bbab';
     // Service account filename or relative path.
     // Dynamic resolution in get_fcm_service_account_path() works across local XAMPP and live production servers.
@@ -69,6 +70,9 @@ class Api extends CI_Controller
 
         // Ensure upload directories and index protection exist
         $this->ensure_directories();
+
+        // Ensure database schema migrations exist
+        $this->ensure_schema();
     }
 
     // =========================================================================
@@ -109,10 +113,12 @@ class Api extends CI_Controller
      */
     public function register()
     {
-        $name     = $this->get_input('name');
-        $email    = $this->get_input('email');
-        $mobile   = $this->get_input('mobile');
-        $password = $this->get_input('password');
+        $name        = $this->get_input('name');
+        $email       = $this->get_input('email');
+        $mobile      = $this->get_input('mobile');
+        $password    = $this->get_input('password');
+        $fcm_token   = $this->get_input('fcm_token');
+        $device_info = $this->get_input('device_info');
 
         if (empty($name)) {
             $this->response(false, 'Name is required', null, 422);
@@ -170,6 +176,17 @@ class Api extends CI_Controller
         $user = $this->db->where('id', $user_id)->get('users')->row_array();
         $token = $this->generate_jwt($user_id);
 
+        // Automatically save FCM device token if provided during registration
+        if (!empty($fcm_token)) {
+            $this->db->where('fcm_token', $fcm_token)->delete('device_tokens');
+            $this->db->insert('device_tokens', [
+                'user_id'     => $user_id,
+                'fcm_token'   => $fcm_token,
+                'device_info' => $device_info ?: null,
+                'updated_at'  => $now
+            ]);
+        }
+
         // Notify other active devices that a new user joined
         $this->broadcast_fcm_notification($user_id, 'New Contact', "{$name} joined", [
             'type'      => 'new_user',
@@ -178,8 +195,9 @@ class Api extends CI_Controller
         ]);
 
         $this->response(true, 'User registered successfully', [
-            'user'  => $this->format_user($user),
-            'token' => $token
+            'user'                 => $this->format_user($user),
+            'token'                => $token,
+            'fcm_token_registered' => !empty($fcm_token)
         ], 201);
     }
 
@@ -233,8 +251,9 @@ class Api extends CI_Controller
         $user['last_seen'] = $now;
 
         $this->response(true, 'Login successful', [
-            'user'  => $this->format_user($user),
-            'token' => $token
+            'user'                 => $this->format_user($user),
+            'token'                => $token,
+            'fcm_token_registered' => !empty($fcm_token)
         ], 200);
     }
 
@@ -251,6 +270,9 @@ class Api extends CI_Controller
             $this->db->where('user_id', $user['id'])
                 ->where('fcm_token', $fcm_token)
                 ->delete('device_tokens');
+        } else {
+            // If no specific token passed, clear all device tokens for this user
+            $this->db->where('user_id', $user['id'])->delete('device_tokens');
         }
 
         $this->db->where('id', $user['id'])->update('users', [
@@ -259,6 +281,50 @@ class Api extends CI_Controller
         ]);
 
         $this->response(true, 'Logged out successfully', null, 200);
+    }
+
+    /**
+     * POST api/change_password
+     * Authenticated endpoint to change the current user's password.
+     * Parameters: old_password, new_password, [confirm_password]
+     */
+    public function change_password()
+    {
+        $user             = $this->authenticate();
+        $old_password     = $this->get_input('old_password');
+        $new_password     = $this->get_input('new_password');
+        $confirm_password = $this->get_input('confirm_password');
+
+        if (empty($old_password)) {
+            $this->response(false, 'Current password is required', null, 422);
+        }
+
+        if (!password_verify($old_password, $user['password_hash'])) {
+            $this->response(false, 'Current password is incorrect', null, 400);
+        }
+
+        if (empty($new_password) || strlen($new_password) < 6) {
+            $this->response(false, 'New password must be at least 6 characters long', null, 422);
+        }
+
+        if ($old_password === $new_password) {
+            $this->response(false, 'New password must be different from current password', null, 400);
+        }
+
+        if ($confirm_password !== null && $confirm_password !== '' && $confirm_password !== $new_password) {
+            $this->response(false, 'New password and confirmation do not match', null, 422);
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $this->db->where('id', $user['id'])->update('users', [
+            'password_hash' => password_hash($new_password, PASSWORD_BCRYPT),
+            'updated_at'    => $now
+        ]);
+
+        $this->response(true, 'Password changed successfully', [
+            'user_id'    => (int)$user['id'],
+            'updated_at' => $now
+        ], 200);
     }
 
     /**
@@ -460,6 +526,7 @@ class Api extends CI_Controller
      */
     public function save_token()
     {
+
         $user        = $this->authenticate();
         $fcm_token   = $this->get_input('fcm_token');
         $device_info = $this->get_input('device_info');
@@ -480,6 +547,25 @@ class Api extends CI_Controller
 
         $this->response(true, 'Device token registered successfully', [
             'fcm_token' => $fcm_token
+        ], 200);
+    }
+
+    /**
+     * GET api/check_device_token
+     * Check if current user has an FCM device token registered.
+     */
+    public function check_device_token()
+    {
+        $user   = $this->authenticate();
+        $tokens = $this->db->select('id, fcm_token, device_info, updated_at')
+            ->where('user_id', $user['id'])
+            ->get('device_tokens')
+            ->result_array();
+
+        $this->response(true, 'Device tokens status', [
+            'has_token' => !empty($tokens),
+            'count'     => count($tokens),
+            'tokens'    => $tokens
         ], 200);
     }
 
@@ -527,6 +613,8 @@ class Api extends CI_Controller
                        m.id AS msg_id, m.sender_id AS msg_sender_id, m.receiver_id AS msg_receiver_id,
                        m.message_type AS msg_type, m.message_text AS msg_text, m.media_url AS msg_media_url,
                        m.media_size AS msg_media_size, m.status AS msg_status, m.created_at AS msg_created_at,
+                       m.is_edited AS msg_is_edited, m.is_deleted AS msg_is_deleted,
+                       m.deleted_by_sender AS msg_deleted_by_sender, m.deleted_by_receiver AS msg_deleted_by_receiver,
                        (SELECT COUNT(*) FROM messages msg 
                         WHERE msg.conversation_id = c.id 
                           AND msg.receiver_id = ? 
@@ -561,17 +649,25 @@ class Api extends CI_Controller
 
             $last_message = null;
             if (!empty($r['msg_id'])) {
-                $last_message = [
-                    'id'           => (int)$r['msg_id'],
-                    'sender_id'    => (int)$r['msg_sender_id'],
-                    'receiver_id'  => (int)$r['msg_receiver_id'],
-                    'message_type' => $r['msg_type'],
-                    'message_text' => $r['msg_text'],
-                    'media_url'    => !empty($r['msg_media_url']) ? base_url($r['msg_media_url']) : null,
-                    'media_size'   => (int)$r['msg_media_size'],
-                    'status'       => $r['msg_status'],
-                    'created_at'   => $r['msg_created_at']
-                ];
+                $is_msg_deleted = !empty($r['msg_is_deleted']);
+                $deleted_for_me = ((int)$r['msg_sender_id'] === $my_id && !empty($r['msg_deleted_by_sender'])) ||
+                    ((int)$r['msg_receiver_id'] === $my_id && !empty($r['msg_deleted_by_receiver']));
+
+                if (!$deleted_for_me) {
+                    $last_message = [
+                        'id'           => (int)$r['msg_id'],
+                        'sender_id'    => (int)$r['msg_sender_id'],
+                        'receiver_id'  => (int)$r['msg_receiver_id'],
+                        'message_type' => $r['msg_type'],
+                        'message_text' => $is_msg_deleted ? 'This message was deleted' : $r['msg_text'],
+                        'media_url'    => ($is_msg_deleted || empty($r['msg_media_url'])) ? null : base_url($r['msg_media_url']),
+                        'media_size'   => $is_msg_deleted ? 0 : (int)$r['msg_media_size'],
+                        'status'       => $r['msg_status'],
+                        'created_at'   => $r['msg_created_at'],
+                        'is_edited'    => (bool)(!empty($r['msg_is_edited']) && !$is_msg_deleted),
+                        'is_deleted'   => (bool)$is_msg_deleted
+                    ];
+                }
             }
 
             $list[] = [
@@ -638,6 +734,12 @@ class Api extends CI_Controller
 
         $this->db->where('conversation_id', $conv_id);
 
+        // Exclude messages deleted by current user for "me"
+        $this->db->group_start()
+            ->where("(sender_id = {$my_id} AND (deleted_by_sender IS NULL OR deleted_by_sender = 0))")
+            ->or_where("(receiver_id = {$my_id} AND (deleted_by_receiver IS NULL OR deleted_by_receiver = 0))")
+            ->group_end();
+
         if ($after_id > 0) {
             // Polling forward for new messages
             $this->db->where('id >', $after_id);
@@ -659,17 +761,22 @@ class Api extends CI_Controller
 
         $formatted = [];
         foreach ($raw_messages as $m) {
+            $is_del = !empty($m['is_deleted']);
+            $is_edt = !empty($m['is_edited']) && !$is_del;
             $formatted[] = [
                 'id'              => (int)$m['id'],
                 'conversation_id' => (int)$m['conversation_id'],
                 'sender_id'       => (int)$m['sender_id'],
                 'receiver_id'     => (int)$m['receiver_id'],
                 'message_type'    => $m['message_type'],
-                'message_text'    => $m['message_text'],
-                'media_url'       => !empty($m['media_url']) ? base_url($m['media_url']) : null,
-                'media_size'      => (int)$m['media_size'],
+                'message_text'    => $is_del ? 'This message was deleted' : $m['message_text'],
+                'media_url'       => ($is_del || empty($m['media_url'])) ? null : base_url($m['media_url']),
+                'media_size'      => $is_del ? 0 : (int)$m['media_size'],
                 'status'          => $m['status'],
-                'created_at'      => $m['created_at']
+                'created_at'      => $m['created_at'],
+                'is_edited'       => (bool)$is_edt,
+                'edited_at'       => $m['edited_at'] ?? null,
+                'is_deleted'      => (bool)$is_del
             ];
         }
 
@@ -742,12 +849,14 @@ class Api extends CI_Controller
         $msg_data['id'] = (int)$message_id;
 
         // Dispatch FCM push notification
+        $sender_avatar = !empty($current_user['avatar']) ? (string)$current_user['avatar'] : '';
         $this->send_fcm_notification($receiver_id, $current_user['name'], $message_text, [
             'type'            => 'chat',
             'conversation_id' => (string)$conv_id,
             'sender_id'       => (string)$sender_id,
-            'sender_name'     => $current_user['name'],
-            'message_type'    => 'text',
+            'sender_name'     => (string)$current_user['name'],
+            'sender_avatar'   => $sender_avatar,
+            'msg_type'        => 'text',
             'message_id'      => (string)$message_id
         ]);
 
@@ -857,12 +966,14 @@ class Api extends CI_Controller
             $push_body .= ': ' . $caption;
         }
 
+        $sender_avatar = !empty($current_user['avatar']) ? (string)$current_user['avatar'] : '';
         $this->send_fcm_notification($receiver_id, $current_user['name'], $push_body, [
             'type'            => 'chat',
             'conversation_id' => (string)$conv_id,
             'sender_id'       => (string)$sender_id,
-            'sender_name'     => $current_user['name'],
-            'message_type'    => $msg_type,
+            'sender_name'     => (string)$current_user['name'],
+            'sender_avatar'   => $sender_avatar,
+            'msg_type'        => $msg_type,
             'message_id'      => (string)$message_id
         ]);
 
@@ -896,6 +1007,134 @@ class Api extends CI_Controller
         $this->response(true, 'Messages marked as read', [
             'marked_count' => (int)$affected
         ], 200);
+    }
+
+    /**
+     * POST api/edit_message
+     * Edit text content of an existing message sent by current user.
+     * Parameters: message_id (int), message_text (string)
+     */
+    public function edit_message()
+    {
+        $this->ensure_schema();
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $message_id   = (int)$this->get_input('message_id');
+        $message_text = trim((string)$this->get_input('message_text'));
+
+        if (empty($message_id)) {
+            $this->response(false, 'message_id is required', null, 422);
+        }
+
+        if ($message_text === '') {
+            $this->response(false, 'message_text cannot be empty', null, 422);
+        }
+
+        $msg = $this->db->where('id', $message_id)->get('messages')->row_array();
+        if (!$msg) {
+            $this->response(false, 'Message not found', null, 404);
+        }
+
+        if ((int)$msg['sender_id'] !== $my_id) {
+            $this->response(false, 'You can only edit your own messages', null, 403);
+        }
+
+        if (!empty($msg['is_deleted'])) {
+            $this->response(false, 'Deleted messages cannot be edited', null, 400);
+        }
+
+        if ($msg['message_type'] !== 'text') {
+            $this->response(false, 'Only text messages can be edited', null, 400);
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $this->db->where('id', $message_id)->update('messages', [
+            'message_text' => $message_text,
+            'is_edited'    => 1,
+            'edited_at'    => $now
+        ]);
+
+        $updated_msg = $this->db->where('id', $message_id)->get('messages')->row_array();
+
+        $formatted = [
+            'id'              => (int)$updated_msg['id'],
+            'conversation_id' => (int)$updated_msg['conversation_id'],
+            'sender_id'       => (int)$updated_msg['sender_id'],
+            'receiver_id'     => (int)$updated_msg['receiver_id'],
+            'message_type'    => $updated_msg['message_type'],
+            'message_text'    => $updated_msg['message_text'],
+            'media_url'       => !empty($updated_msg['media_url']) ? base_url($updated_msg['media_url']) : null,
+            'media_size'      => (int)$updated_msg['media_size'],
+            'status'          => $updated_msg['status'],
+            'created_at'      => $updated_msg['created_at'],
+            'is_edited'       => true,
+            'edited_at'       => $updated_msg['edited_at'],
+            'is_deleted'      => false
+        ];
+
+        $this->response(true, 'Message updated successfully', [
+            'message' => $formatted
+        ], 200);
+    }
+
+    /**
+     * POST api/delete_message
+     * Deletes a message either for everyone (sender only) or for me.
+     * Parameters: message_id (int), delete_type ('everyone' | 'me')
+     */
+    public function delete_message()
+    {
+        $this->ensure_schema();
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $message_id   = (int)$this->get_input('message_id');
+        $delete_type  = strtolower(trim((string)$this->get_input('delete_type', 'everyone')));
+
+        if (empty($message_id)) {
+            $this->response(false, 'message_id is required', null, 422);
+        }
+
+        $msg = $this->db->where('id', $message_id)->get('messages')->row_array();
+        if (!$msg) {
+            $this->response(false, 'Message not found', null, 404);
+        }
+
+        $is_sender   = ((int)$msg['sender_id'] === $my_id);
+        $is_receiver = ((int)$msg['receiver_id'] === $my_id);
+
+        if (!$is_sender && !$is_receiver) {
+            $this->response(false, 'Access denied', null, 403);
+        }
+
+        if ($delete_type === 'everyone') {
+            if (!$is_sender) {
+                $this->response(false, 'Only the sender can delete a message for everyone', null, 403);
+            }
+
+            $this->db->where('id', $message_id)->update('messages', [
+                'is_deleted'   => 1,
+                'message_text' => 'This message was deleted',
+                'media_url'    => null,
+                'media_size'   => 0
+            ]);
+
+            $this->response(true, 'Message deleted for everyone', [
+                'message_id'  => $message_id,
+                'delete_type' => 'everyone'
+            ], 200);
+        } else {
+            // Delete for me
+            if ($is_sender) {
+                $this->db->where('id', $message_id)->update('messages', ['deleted_by_sender' => 1]);
+            } else {
+                $this->db->where('id', $message_id)->update('messages', ['deleted_by_receiver' => 1]);
+            }
+
+            $this->response(true, 'Message deleted for you', [
+                'message_id'  => $message_id,
+                'delete_type' => 'me'
+            ], 200);
+        }
     }
 
     /**
@@ -962,50 +1201,129 @@ class Api extends CI_Controller
 
 
 
-/**
- * TEMPORARY - GET api/test_push?token=FCM_TOKEN
- * Sends one test push and shows Google's raw reply. DELETE after testing.
- */
-public function test_push()
-{
-    $token = $this->get_input('token');
-    if (empty($token)) {
-        $this->response(false, 'token is required', null, 422);
+    /**
+     * TEMPORARY - GET api/test_push?token=FCM_TOKEN
+     * Sends one test push and shows Google's raw reply. DELETE after testing.
+     */
+    public function test_push()
+    {
+        $token = $this->get_input('token');
+        if (empty($token)) {
+            $this->response(false, 'token is required', null, 422);
+        }
+
+        $access_token = $this->get_fcm_access_token();
+        if (!$access_token) {
+            $this->response(false, 'Could not get Google access token. Check the service account path, openssl/curl, and application/logs', null, 500);
+        }
+
+        $url = 'https://fcm.googleapis.com/v1/projects/' . self::FCM_PROJECT_ID . '/messages:send';
+        $payload = ['message' => [
+            'token'        => $token,
+            'notification' => ['title' => 'Test', 'body' => 'Hello from backend'],
+            'data'         => ['type' => 'test'],
+            'android'      => ['priority' => 'HIGH']
+        ]];
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Authorization: Bearer ' . $access_token,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        $response  = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_err  = curl_error($ch);
+        curl_close($ch);
+
+        $this->response($http_code === 200, $http_code === 200 ? 'Push accepted by FCM' : 'Push failed', [
+            'http_code'    => $http_code,
+            'curl_error'   => $curl_err,
+            'fcm_response' => json_decode($response, true)
+        ], 200);
     }
 
-    $access_token = $this->get_fcm_access_token();
-    if (!$access_token) {
-        $this->response(false, 'Could not get Google access token. Check the service account path, openssl/curl, and application/logs', null, 500);
+    /**
+     * GET api/fcm_status
+     * Diagnostic endpoint to check Firebase Cloud Messaging service account,
+     * token status, registered devices, and recent push notification dispatch logs.
+     */
+    public function fcm_status()
+    {
+        $sa_path = $this->get_fcm_service_account_path();
+        $file_exists = !empty($sa_path) && file_exists($sa_path);
+
+        $sa_info = null;
+        if ($file_exists) {
+            $json = json_decode(@file_get_contents($sa_path), true);
+            if (is_array($json)) {
+                $sa_info = [
+                    'project_id'   => $json['project_id'] ?? null,
+                    'client_email' => $json['client_email'] ?? null,
+                ];
+            }
+        }
+
+        $token = $this->get_fcm_access_token();
+        $device_tokens_count = $this->db->count_all('device_tokens');
+        $recent_logs = $this->db->order_by('id', 'DESC')->limit(10)->get('notification_logs')->result_array();
+
+        $this->response(true, 'FCM status retrieved successfully', [
+            'database_name'              => $this->db->database,
+            'fcm_project_id'             => self::FCM_PROJECT_ID,
+            'service_account_configured' => $file_exists,
+            'service_account_path'       => $sa_path,
+            'service_account_info'       => $sa_info,
+            'oauth_token_available'      => !empty($token),
+            'registered_device_count'    => (int)$device_tokens_count,
+            'recent_notification_logs'   => $recent_logs
+        ], 200);
     }
 
-    $url = 'https://fcm.googleapis.com/v1/projects/' . self::FCM_PROJECT_ID . '/messages:send';
-    $payload = ['message' => [
-        'token'        => $token,
-        'notification' => ['title' => 'Test', 'body' => 'Hello from backend'],
-        'data'         => ['type' => 'test'],
-        'android'      => ['priority' => 'HIGH']
-    ]];
+    /**
+     * POST api/upload_service_account
+     * Installs or updates the Firebase Service Account JSON key.
+     */
+    public function upload_service_account()
+    {
+        $json_content = null;
 
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Authorization: Bearer ' . $access_token,
-        'Content-Type: application/json'
-    ]);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    $response  = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curl_err  = curl_error($ch);
-    curl_close($ch);
+        if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
+            $json_content = @file_get_contents($_FILES['file']['tmp_name']);
+        } else {
+            $json_content = $this->get_input('service_account_json');
+        }
 
-    $this->response($http_code === 200, $http_code === 200 ? 'Push accepted by FCM' : 'Push failed', [
-        'http_code'    => $http_code,
-        'curl_error'   => $curl_err,
-        'fcm_response' => json_decode($response, true)
-    ], 200);
-}
+        if (empty($json_content)) {
+            $this->response(false, 'Please provide service_account_json parameter or upload a JSON file under "file"', null, 422);
+        }
+
+        $decoded = json_decode($json_content, true);
+        if (!is_array($decoded) || !isset($decoded['client_email']) || !isset($decoded['private_key'])) {
+            $this->response(false, 'Invalid service account JSON: missing client_email or private_key fields', null, 422);
+        }
+
+        $target = FCPATH . 'firebase-service-account.json';
+        $written = @file_put_contents($target, json_encode($decoded, JSON_PRETTY_PRINT));
+        if (!$written) {
+            $this->response(false, 'Failed to write service account to ' . $target . '. Check write permissions.', null, 500);
+        }
+
+        // Invalidate cached OAuth token
+        $cache_file = APPPATH . 'cache/fcm_oauth_token.json';
+        if (file_exists($cache_file)) {
+            @unlink($cache_file);
+        }
+
+        $this->response(true, 'Firebase service account successfully installed and activated! Push notifications are now enabled.', [
+            'project_id'   => $decoded['project_id'] ?? null,
+            'client_email' => $decoded['client_email'],
+            'saved_path'   => $target
+        ], 200);
+    }
 
 
 
@@ -1075,6 +1393,45 @@ public function test_push()
         if ($input_data === null) {
             $get  = $this->input->get(NULL, TRUE) ?: [];
             $post = $this->input->post(NULL, TRUE) ?: [];
+
+            // Robust query string recovery for Nginx / index.php routing
+            if (!empty($_SERVER['QUERY_STRING'])) {
+                $qs = $_SERVER['QUERY_STRING'];
+                // Handle second '?' e.g. /api/messages?other_user_id=1
+                $pos = strpos($qs, '?');
+                if ($pos !== false) {
+                    parse_str(substr($qs, $pos + 1), $extra_get);
+                    if (is_array($extra_get)) {
+                        $get = array_merge($get, $extra_get);
+                    }
+                }
+                // Handle & e.g. /api/messages&other_user_id=1
+                parse_str($qs, $all_get);
+                if (is_array($all_get)) {
+                    foreach ($all_get as $k => $v) {
+                        if (strpos($k, '/') === false && strpos($k, 'api') === false) {
+                            $get[$k] = $v;
+                        }
+                    }
+                }
+            }
+
+            // Also check REQUEST_URI for trailing query strings
+            if (!empty($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], '?') !== false) {
+                $uri_parts = explode('?', $_SERVER['REQUEST_URI']);
+                if (count($uri_parts) > 1) {
+                    for ($i = 1; $i < count($uri_parts); $i++) {
+                        parse_str($uri_parts[$i], $uri_get);
+                        if (is_array($uri_get)) {
+                            foreach ($uri_get as $uk => $uv) {
+                                if (strpos($uk, '/') === false && strpos($uk, 'api') === false) {
+                                    $get[$uk] = $uv;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             $raw_body = file_get_contents('php://input');
             $json = [];
@@ -1302,6 +1659,42 @@ public function test_push()
     }
 
     /**
+     * Automatically applies schema migrations for edit/delete columns
+     * so both local development and live servers support new features immediately.
+     */
+    private function ensure_schema()
+    {
+        static $schema_checked = false;
+        if ($schema_checked) {
+            return;
+        }
+        $schema_checked = true;
+
+        try {
+            if ($this->db->table_exists('messages')) {
+                $fields = $this->db->list_fields('messages');
+                if (!in_array('is_edited', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `is_edited` TINYINT(1) NOT NULL DEFAULT 0");
+                }
+                if (!in_array('edited_at', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `edited_at` DATETIME NULL DEFAULT NULL");
+                }
+                if (!in_array('is_deleted', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `is_deleted` TINYINT(1) NOT NULL DEFAULT 0");
+                }
+                if (!in_array('deleted_by_sender', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `deleted_by_sender` TINYINT(1) NOT NULL DEFAULT 0");
+                }
+                if (!in_array('deleted_by_receiver', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `deleted_by_receiver` TINYINT(1) NOT NULL DEFAULT 0");
+                }
+            }
+        } catch (\Throwable $e) {
+            log_message('error', 'Schema check exception: ' . $e->getMessage());
+        }
+    }
+
+    /**
      * Resolves the FCM service account JSON file path dynamically.
      * Works seamlessly across both local development (e.g. XAMPP) and live production servers (Linux/Unix/Windows),
      * preventing breaks caused by hardcoded absolute paths.
@@ -1439,6 +1832,14 @@ public function test_push()
         try {
             $access_token = $this->get_fcm_access_token();
             if (!$access_token) {
+                $sa_path = $this->get_fcm_service_account_path();
+                $this->db->insert('notification_logs', [
+                    'user_id'      => (int)$receiver_id,
+                    'title'        => (string)$title,
+                    'body'         => (string)$body,
+                    'fcm_response' => 'NOTIFICATION PENDING: Firebase service account key not yet placed. Upload key to: ' . $sa_path,
+                    'created_at'   => date('Y-m-d H:i:s')
+                ]);
                 return;
             }
 
@@ -1471,7 +1872,12 @@ public function test_push()
                         'android'      => [
                             'priority'     => 'HIGH',
                             'notification' => [
-                                'channel_id' => 'chat_messages'
+                                'channel_id'              => 'chat_messages',
+                                'sound'                   => 'default',
+                                'default_sound'           => true,
+                                'default_vibrate_timings' => true,
+                                'notification_priority'   => 'PRIORITY_MAX',
+                                'visibility'              => 'PUBLIC'
                             ]
                         ]
                     ]
@@ -1504,12 +1910,7 @@ public function test_push()
                     'created_at'   => date('Y-m-d H:i:s')
                 ]);
 
-                // Cleanup dead tokens
-                if ($http_code === 400 || $http_code === 404) {
-                    if (stripos($resp_str, 'UNREGISTERED') !== false || stripos($resp_str, 'INVALID_ARGUMENT') !== false) {
-                        $this->db->where('fcm_token', $fcm_token)->delete('device_tokens');
-                    }
-                }
+                // FCM device tokens are preserved permanently and ONLY removed upon explicit user logout
             }
         } catch (\Throwable $e) {
             log_message('error', 'FCM Notification Exception: ' . $e->getMessage());
@@ -1524,6 +1925,14 @@ public function test_push()
         try {
             $access_token = $this->get_fcm_access_token();
             if (!$access_token) {
+                $sa_path = $this->get_fcm_service_account_path();
+                $this->db->insert('notification_logs', [
+                    'user_id'      => (int)$exclude_user_id,
+                    'title'        => (string)$title,
+                    'body'         => (string)$body,
+                    'fcm_response' => 'NOTIFICATION PENDING: Firebase service account key not yet placed. Upload key to: ' . $sa_path,
+                    'created_at'   => date('Y-m-d H:i:s')
+                ]);
                 return;
             }
 
@@ -1556,7 +1965,12 @@ public function test_push()
                         'android'      => [
                             'priority'     => 'HIGH',
                             'notification' => [
-                                'channel_id' => 'chat_messages'
+                                'channel_id'              => 'chat_messages',
+                                'sound'                   => 'default',
+                                'default_sound'           => true,
+                                'default_vibrate_timings' => true,
+                                'notification_priority'   => 'PRIORITY_MAX',
+                                'visibility'              => 'PUBLIC'
                             ]
                         ]
                     ]
@@ -1588,11 +2002,7 @@ public function test_push()
                     'created_at'   => date('Y-m-d H:i:s')
                 ]);
 
-                if ($http_code === 400 || $http_code === 404) {
-                    if (stripos($resp_str, 'UNREGISTERED') !== false || stripos($resp_str, 'INVALID_ARGUMENT') !== false) {
-                        $this->db->where('fcm_token', $fcm_token)->delete('device_tokens');
-                    }
-                }
+                // FCM device tokens are preserved permanently and ONLY removed upon explicit user logout
             }
         } catch (\Throwable $e) {
             log_message('error', 'FCM Broadcast Exception: ' . $e->getMessage());
