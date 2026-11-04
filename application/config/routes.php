@@ -95,5 +95,15 @@ $route['api/update_member_role']   = 'api/update_member_role';
 $route['api/remove_group_member']  = 'api/remove_group_member';
 $route['api/mark_group_read']      = 'api/mark_group_read';
 
+// 1-to-1 WebRTC Calling Routes
+$route['api/call_initiate']        = 'api/call_initiate';
+$route['api/call_answer']          = 'api/call_answer';
+$route['api/call_reject']          = 'api/call_reject';
+$route['api/call_end']             = 'api/call_end';
+$route['api/call_status']          = 'api/call_status';
+$route['api/call_signal']          = 'api/call_signal';
+$route['api/call_signals']         = 'api/call_signals';
+$route['api/call_logs']            = 'api/call_logs';
+
 $route['api/(:any)']               = 'api/$1';
 

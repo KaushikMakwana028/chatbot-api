@@ -2234,6 +2234,419 @@ class Api extends CI_Controller
         ], 200);
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | 1-TO-1 WebRTC VOICE & VIDEO CALLING ENDPOINTS (100% FREE P2P)
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * POST api/call_initiate
+     * Starts a 1-to-1 WebRTC audio or video call session and rings the receiver via FCM.
+     */
+    public function call_initiate()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $receiver_id  = (int)$this->get_input('receiver_id');
+        $call_type    = strtolower(trim((string)$this->get_input('call_type'))) === 'video' ? 'video' : 'audio';
+        $offer_sdp    = $this->get_input('offer_sdp');
+
+        if (empty($receiver_id)) {
+            $this->response(false, 'receiver_id is required', null, 422);
+        }
+        if ($receiver_id === $my_id) {
+            $this->response(false, 'You cannot call yourself', null, 422);
+        }
+
+        // Verify receiver exists
+        $receiver = $this->db->where('id', $receiver_id)->get('users')->row_array();
+        if (!$receiver) {
+            $this->response(false, 'Receiver not found', null, 404);
+        }
+
+        // Check if receiver is already in an active call
+        $busy_check = $this->db->query("
+            SELECT id FROM `calls`
+            WHERE (receiver_id = ? OR caller_id = ?)
+              AND status IN ('ringing', 'accepted')
+              AND updated_at >= DATE_SUB(NOW(), INTERVAL 60 SECOND)
+            LIMIT 1
+        ", [$receiver_id, $receiver_id])->row_array();
+
+        if ($busy_check) {
+            $this->db->insert('calls', [
+                'caller_id'        => $my_id,
+                'receiver_id'      => $receiver_id,
+                'call_type'        => $call_type,
+                'status'           => 'busy',
+                'offer_sdp'        => $offer_sdp ?: null,
+                'started_at'       => null,
+                'ended_at'         => date('Y-m-d H:i:s'),
+                'duration_seconds' => 0,
+                'created_at'       => date('Y-m-d H:i:s'),
+                'updated_at'       => date('Y-m-d H:i:s')
+            ]);
+            $call_id = (int)$this->db->insert_id();
+
+            $this->response(true, 'User is busy on another call', [
+                'call_id' => $call_id,
+                'status'  => 'busy'
+            ], 200);
+            return;
+        }
+
+        // Create ringing call record
+        $now = date('Y-m-d H:i:s');
+        $this->db->insert('calls', [
+            'caller_id'        => $my_id,
+            'receiver_id'      => $receiver_id,
+            'call_type'        => $call_type,
+            'status'           => 'ringing',
+            'offer_sdp'        => $offer_sdp ?: null,
+            'started_at'       => null,
+            'ended_at'         => null,
+            'duration_seconds' => 0,
+            'created_at'       => $now,
+            'updated_at'       => $now
+        ]);
+        $call_id = (int)$this->db->insert_id();
+
+        // High priority ringing push notification via FCM
+        $caller_avatar = !empty($current_user['profile_image']) ? $this->get_full_url($current_user['profile_image']) : '';
+        $call_label = ($call_type === 'video') ? 'Incoming Video Call' : 'Incoming Voice Call';
+
+        $this->send_fcm_notification(
+            $receiver_id,
+            $call_label,
+            "{$current_user['name']} is calling...",
+            [
+                'type'          => 'incoming_call',
+                'call_id'       => (string)$call_id,
+                'caller_id'     => (string)$my_id,
+                'caller_name'   => (string)$current_user['name'],
+                'caller_avatar' => (string)$caller_avatar,
+                'call_type'     => (string)$call_type
+            ]
+        );
+
+        $this->response(true, 'Call initiated successfully', [
+            'call_id'     => $call_id,
+            'caller_id'   => $my_id,
+            'receiver_id' => $receiver_id,
+            'call_type'   => $call_type,
+            'status'      => 'ringing',
+            'created_at'  => $now
+        ], 201);
+    }
+
+    /**
+     * POST api/call_answer
+     * Receiver accepts the call and submits their WebRTC answer SDP.
+     */
+    public function call_answer()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+        $answer_sdp   = $this->get_input('answer_sdp');
+
+        if (empty($call_id)) {
+            $this->response(false, 'call_id is required', null, 422);
+        }
+
+        $call = $this->db->where('id', $call_id)->get('calls')->row_array();
+        if (!$call) {
+            $this->response(false, 'Call not found', null, 404);
+        }
+
+        if ((int)$call['receiver_id'] !== $my_id) {
+            $this->response(false, 'Only the receiver can accept this call', null, 403);
+        }
+
+        if ($call['status'] !== 'ringing') {
+            $this->response(false, "Call is already {$call['status']}", [
+                'call_id' => $call_id,
+                'status'  => $call['status']
+            ], 400);
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $this->db->where('id', $call_id)->update('calls', [
+            'status'     => 'accepted',
+            'answer_sdp' => $answer_sdp ?: null,
+            'started_at' => $now,
+            'updated_at' => $now
+        ]);
+
+        $this->response(true, 'Call accepted', [
+            'call_id'    => $call_id,
+            'status'     => 'accepted',
+            'started_at' => $now
+        ], 200);
+    }
+
+    /**
+     * POST api/call_reject
+     * Declines or rejects an incoming ringing call.
+     */
+    public function call_reject()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+        $reason       = strtolower(trim((string)$this->get_input('reason')));
+        $final_status = in_array($reason, ['busy', 'missed', 'rejected']) ? $reason : 'rejected';
+
+        if (empty($call_id)) {
+            $this->response(false, 'call_id is required', null, 422);
+        }
+
+        $call = $this->db->where('id', $call_id)->get('calls')->row_array();
+        if (!$call) {
+            $this->response(false, 'Call not found', null, 404);
+        }
+
+        if ((int)$call['receiver_id'] !== $my_id && (int)$call['caller_id'] !== $my_id) {
+            $this->response(false, 'Not authorized for this call', null, 403);
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $this->db->where('id', $call_id)->update('calls', [
+            'status'     => $final_status,
+            'ended_at'   => $now,
+            'updated_at' => $now
+        ]);
+
+        $this->response(true, "Call marked as {$final_status}", [
+            'call_id' => $call_id,
+            'status'  => $final_status
+        ], 200);
+    }
+
+    /**
+     * POST api/call_end
+     * Either participant ends or hangs up the active call.
+     */
+    public function call_end()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+
+        if (empty($call_id)) {
+            $this->response(false, 'call_id is required', null, 422);
+        }
+
+        $call = $this->db->where('id', $call_id)->get('calls')->row_array();
+        if (!$call) {
+            $this->response(false, 'Call not found', null, 404);
+        }
+
+        if ((int)$call['caller_id'] !== $my_id && (int)$call['receiver_id'] !== $my_id) {
+            $this->response(false, 'Not authorized for this call', null, 403);
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $duration = 0;
+        if (!empty($call['started_at'])) {
+            $duration = max(0, strtotime($now) - strtotime($call['started_at']));
+        }
+
+        $this->db->where('id', $call_id)->update('calls', [
+            'status'           => 'ended',
+            'ended_at'         => $now,
+            'duration_seconds' => $duration,
+            'updated_at'       => $now
+        ]);
+
+        // Insert hangup signal so peer disconnects immediately
+        $this->db->insert('call_signals', [
+            'call_id'    => $call_id,
+            'sender_id'  => $my_id,
+            'type'       => 'hangup',
+            'payload'    => json_encode(['by_user_id' => $my_id]),
+            'created_at' => $now
+        ]);
+
+        $this->response(true, 'Call ended', [
+            'call_id'          => $call_id,
+            'status'           => 'ended',
+            'duration_seconds' => $duration
+        ], 200);
+    }
+
+    /**
+     * GET api/call_status
+     * Returns current status, answer SDP, and call details.
+     */
+    public function call_status()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+
+        if (empty($call_id)) {
+            $this->response(false, 'call_id is required', null, 422);
+        }
+
+        $call = $this->db->where('id', $call_id)->get('calls')->row_array();
+        if (!$call) {
+            $this->response(false, 'Call not found', null, 404);
+        }
+
+        if ((int)$call['caller_id'] !== $my_id && (int)$call['receiver_id'] !== $my_id) {
+            $this->response(false, 'Not authorized for this call', null, 403);
+        }
+
+        // Auto-mark missed if ringing for more than 45 seconds without answer
+        if ($call['status'] === 'ringing') {
+            $created_ts = strtotime($call['created_at']);
+            if (time() - $created_ts > 45) {
+                $now = date('Y-m-d H:i:s');
+                $this->db->where('id', $call_id)->update('calls', [
+                    'status'     => 'missed',
+                    'ended_at'   => $now,
+                    'updated_at' => $now
+                ]);
+                $call['status'] = 'missed';
+            }
+        }
+
+        $this->response(true, 'Call status', [
+            'call_id'          => (int)$call['id'],
+            'caller_id'        => (int)$call['caller_id'],
+            'receiver_id'      => (int)$call['receiver_id'],
+            'call_type'        => $call['call_type'],
+            'status'           => $call['status'],
+            'offer_sdp'        => $call['offer_sdp'],
+            'answer_sdp'       => $call['answer_sdp'],
+            'started_at'       => $call['started_at'],
+            'duration_seconds' => (int)$call['duration_seconds']
+        ], 200);
+    }
+
+    /**
+     * POST api/call_signal
+     * Sends an ICE candidate or session signal to peer.
+     */
+    public function call_signal()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+        $type         = trim((string)$this->get_input('type'));
+        $payload      = $this->get_input('payload');
+
+        if (empty($call_id) || empty($payload)) {
+            $this->response(false, 'call_id and payload are required', null, 422);
+        }
+
+        $sig_type = ($type === 'hangup') ? 'hangup' : 'ice_candidate';
+
+        $this->db->insert('call_signals', [
+            'call_id'    => $call_id,
+            'sender_id'  => $my_id,
+            'type'       => $sig_type,
+            'payload'    => is_string($payload) ? $payload : json_encode($payload),
+            'created_at' => date('Y-m-d H:i:s')
+        ]);
+
+        $this->response(true, 'Signal sent', [
+            'signal_id' => (int)$this->db->insert_id()
+        ], 201);
+    }
+
+    /**
+     * GET api/call_signals
+     * Retrieves ICE candidate signals from peer for this call.
+     */
+    public function call_signals()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $call_id      = (int)$this->get_input('call_id');
+        $after_id     = (int)$this->get_input('after_id');
+
+        if (empty($call_id)) {
+            $this->response(false, 'call_id is required', null, 422);
+        }
+
+        $signals = $this->db->where('call_id', $call_id)
+            ->where('sender_id !=', $my_id)
+            ->where('id >', $after_id)
+            ->order_by('id', 'ASC')
+            ->get('call_signals')
+            ->result_array();
+
+        $formatted = [];
+        foreach ($signals as $s) {
+            $payload = json_decode($s['payload'], true);
+            $formatted[] = [
+                'id'         => (int)$s['id'],
+                'type'       => $s['type'],
+                'payload'    => $payload !== null ? $payload : $s['payload'],
+                'created_at' => $s['created_at']
+            ];
+        }
+
+        $this->response(true, 'Signals retrieved', [
+            'signals' => $formatted
+        ], 200);
+    }
+
+    /**
+     * GET api/call_logs
+     * Returns user call history (both incoming and outgoing).
+     */
+    public function call_logs()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $limit        = min(50, max(1, (int)($this->get_input('limit') ?: 20)));
+        $offset       = max(0, (int)($this->get_input('offset') ?: 0));
+
+        $sql = "SELECT c.*,
+                       caller.name AS caller_name, caller.profile_image AS caller_image,
+                       receiver.name AS receiver_name, receiver.profile_image AS receiver_image
+                FROM `calls` c
+                INNER JOIN users caller ON caller.id = c.caller_id
+                INNER JOIN users receiver ON receiver.id = c.receiver_id
+                WHERE c.caller_id = ? OR c.receiver_id = ?
+                ORDER BY c.created_at DESC
+                LIMIT ? OFFSET ?";
+
+        $rows = $this->db->query($sql, [$my_id, $my_id, $limit, $offset])->result_array();
+
+        $calls = [];
+        foreach ($rows as $r) {
+            $is_outgoing = ((int)$r['caller_id'] === $my_id);
+            $partner_id = $is_outgoing ? (int)$r['receiver_id'] : (int)$r['caller_id'];
+            $partner_name = $is_outgoing ? $r['receiver_name'] : $r['caller_name'];
+            $partner_image = $is_outgoing ? $r['receiver_image'] : $r['caller_image'];
+
+            $calls[] = [
+                'id'               => (int)$r['id'],
+                'call_type'        => $r['call_type'],
+                'direction'        => $is_outgoing ? 'outgoing' : 'incoming',
+                'status'           => $r['status'],
+                'duration_seconds' => (int)$r['duration_seconds'],
+                'partner'          => [
+                    'id'            => $partner_id,
+                    'name'          => $partner_name,
+                    'profile_image' => !empty($partner_image) ? $this->get_full_url($partner_image) : null
+                ],
+                'started_at'       => $r['started_at'],
+                'ended_at'         => $r['ended_at'],
+                'created_at'       => $r['created_at']
+            ];
+        }
+
+        $this->response(true, 'Call logs retrieved', [
+            'calls' => $calls
+        ], 200);
+    }
+
     /**
      * Broadcasts an FCM push notification to all active members of a group except the sender.
      */
@@ -2740,6 +3153,40 @@ class Api extends CI_Controller
                 if (!in_array('deleted_by_receiver', $fields)) {
                     $this->db->query("ALTER TABLE `messages` ADD COLUMN `deleted_by_receiver` TINYINT(1) NOT NULL DEFAULT 0");
                 }
+            }
+
+            // 4. Ensure calls table exists for 1-to-1 WebRTC audio/video calls
+            if (!$this->db->table_exists('calls')) {
+                $this->db->query("CREATE TABLE IF NOT EXISTS `calls` (
+                    `id` INT(10) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `caller_id` INT(10) UNSIGNED NOT NULL,
+                    `receiver_id` INT(10) UNSIGNED NOT NULL,
+                    `call_type` ENUM('audio', 'video') NOT NULL DEFAULT 'audio',
+                    `status` ENUM('ringing', 'accepted', 'rejected', 'missed', 'ended', 'busy') NOT NULL DEFAULT 'ringing',
+                    `offer_sdp` MEDIUMTEXT NULL,
+                    `answer_sdp` MEDIUMTEXT NULL,
+                    `started_at` DATETIME NULL DEFAULT NULL,
+                    `ended_at` DATETIME NULL DEFAULT NULL,
+                    `duration_seconds` INT(10) UNSIGNED NOT NULL DEFAULT 0,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX `idx_calls_caller` (`caller_id`),
+                    INDEX `idx_calls_receiver` (`receiver_id`),
+                    INDEX `idx_calls_status` (`status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+            }
+
+            // 5. Ensure call_signals table exists for WebRTC ICE candidates
+            if (!$this->db->table_exists('call_signals')) {
+                $this->db->query("CREATE TABLE IF NOT EXISTS `call_signals` (
+                    `id` INT(10) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `call_id` INT(10) UNSIGNED NOT NULL,
+                    `sender_id` INT(10) UNSIGNED NOT NULL,
+                    `type` ENUM('ice_candidate', 'hangup') NOT NULL,
+                    `payload` MEDIUMTEXT NOT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_signals_call_id` (`call_id`, `id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
             }
         } catch (\Throwable $e) {
             log_message('error', 'Schema check exception: ' . $e->getMessage());
