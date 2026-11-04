@@ -1648,6 +1648,8 @@ class Api extends CI_Controller
         $msg_data['id'] = $message_id;
         $msg_data['sender_name']   = $current_user['name'];
         $msg_data['sender_avatar'] = !empty($current_user['profile_image']) ? $current_user['profile_image'] : '';
+        $msg_data['is_edited']     = false;
+        $msg_data['is_deleted']    = false;
 
         // Broadcast FCM to all other active members
         $this->broadcast_group_fcm($group_id, $sender_id, $group['title'], $current_user['name'] . ': ' . $message_text, [
@@ -1773,6 +1775,8 @@ class Api extends CI_Controller
         $msg_data['id'] = $message_id;
         $msg_data['sender_name']   = $current_user['name'];
         $msg_data['sender_avatar'] = !empty($current_user['profile_image']) ? $current_user['profile_image'] : '';
+        $msg_data['is_edited']     = false;
+        $msg_data['is_deleted']    = false;
 
         $push_body = ($msg_type === 'image') ? '📷 Photo' : '🎥 Video';
         if (!empty($caption)) {
@@ -1840,11 +1844,23 @@ class Api extends CI_Controller
         // Filter soft-deleted messages
         $clean_msgs = [];
         foreach ($messages as $m) {
-            if ((int)$m['is_deleted'] === 1) {
-                $m['message_text'] = 'This message was deleted';
-                $m['media_url']    = null;
-            }
-            $clean_msgs[] = $m;
+            $is_del = !empty($m['is_deleted']) && $m['is_deleted'] != '0';
+            $is_edt = !empty($m['is_edited']) && $m['is_edited'] != '0' && !$is_del;
+            $clean_msgs[] = [
+                'id'              => (int)$m['id'],
+                'group_id'        => (int)$m['group_id'],
+                'sender_id'       => (int)$m['sender_id'],
+                'sender_name'     => $m['sender_name'],
+                'sender_avatar'   => $m['sender_avatar'] ?: '',
+                'message_type'    => $m['message_type'],
+                'message_text'    => $is_del ? 'This message was deleted' : $m['message_text'],
+                'media_url'       => $is_del ? null : $m['media_url'],
+                'media_size'      => (int)($m['media_size'] ?? 0),
+                'status'          => $m['status'],
+                'is_edited'       => (bool)$is_edt,
+                'is_deleted'      => (bool)$is_del,
+                'created_at'      => $m['created_at']
+            ];
         }
 
         // Auto mark as read
