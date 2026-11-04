@@ -81,5 +81,19 @@ $route['api/delete_message']       = 'api/delete_message';
 $route['api/mark_read']            = 'api/mark_read';
 $route['api/heartbeat']            = 'api/heartbeat';
 $route['api/user_status']          = 'api/user_status';
+
+// Group Chat Routes
+$route['api/create_group']         = 'api/create_group';
+$route['api/groups']               = 'api/groups';
+$route['api/group_details']        = 'api/group_details';
+$route['api/send_group_message']   = 'api/send_group_message';
+$route['api/send_group_media']     = 'api/send_group_media';
+$route['api/group_messages']       = 'api/group_messages';
+$route['api/add_group_members']    = 'api/add_group_members';
+$route['api/approve_group_member'] = 'api/approve_group_member';
+$route['api/update_member_role']   = 'api/update_member_role';
+$route['api/remove_group_member']  = 'api/remove_group_member';
+$route['api/mark_group_read']      = 'api/mark_group_read';
+
 $route['api/(:any)']               = 'api/$1';
 

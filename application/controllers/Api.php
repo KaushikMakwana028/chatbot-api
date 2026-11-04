@@ -1325,6 +1325,999 @@ class Api extends CI_Controller
         ], 200);
     }
 
+    // =========================================================================
+    // 4. GROUP CHAT ENDPOINTS
+    // =========================================================================
+
+    /**
+     * POST api/create_group
+     * Creates a new group. The creator is assigned role='admin', status='active'.
+     * Any members added by the creator admin are added with status='active' (no permission needed).
+     */
+    public function create_group()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $title        = trim((string)$this->get_input('title'));
+        $description  = trim((string)$this->get_input('description', ''));
+        $member_ids   = $this->get_input('member_ids');
+
+        if (empty($title)) {
+            $this->response(false, 'Group title is required', null, 422);
+        }
+
+        // Handle group icon upload if provided
+        $icon_url = null;
+        if (isset($_FILES['icon']) && $_FILES['icon']['error'] === UPLOAD_ERR_OK) {
+            $ext = strtolower(pathinfo($_FILES['icon']['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
+                $dir = FCPATH . 'uploads/group_icons/';
+                if (!is_dir($dir)) {
+                    @mkdir($dir, 0755, true);
+                }
+                $filename = 'grp_' . time() . '_' . rand(1000, 9999) . '.' . $ext;
+                if (@move_uploaded_file($_FILES['icon']['tmp_name'], $dir . $filename)) {
+                    $icon_url = base_url('uploads/group_icons/' . $filename);
+                }
+            }
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        $this->db->trans_start();
+
+        $this->db->insert('groups', [
+            'title'           => $title,
+            'description'     => $description ?: null,
+            'icon'            => $icon_url,
+            'created_by'      => $my_id,
+            'last_message_id' => null,
+            'created_at'      => $now,
+            'updated_at'      => $now
+        ]);
+        $group_id = (int)$this->db->insert_id();
+
+        // Add creator as Admin (active)
+        $this->db->insert('group_members', [
+            'group_id'             => $group_id,
+            'user_id'              => $my_id,
+            'role'                 => 'admin',
+            'status'               => 'active',
+            'invited_by'           => $my_id,
+            'last_read_message_id' => 0,
+            'joined_at'            => $now
+        ]);
+
+        // Add initial members directly by admin without needing permission
+        $added_user_ids = [];
+        if (!empty($member_ids)) {
+            $ids = is_array($member_ids) ? $member_ids : explode(',', (string)$member_ids);
+            foreach ($ids as $id) {
+                $uid = (int)trim($id);
+                if ($uid > 0 && $uid !== $my_id) {
+                    $exists = $this->db->where('id', $uid)->get('users')->row_array();
+                    if ($exists) {
+                        $this->db->insert('group_members', [
+                            'group_id'             => $group_id,
+                            'user_id'              => $uid,
+                            'role'                 => 'member',
+                            'status'               => 'active',
+                            'invited_by'           => $my_id,
+                            'last_read_message_id' => 0,
+                            'joined_at'            => $now
+                        ]);
+                        $added_user_ids[] = $uid;
+                    }
+                }
+            }
+        }
+
+        $this->db->trans_complete();
+
+        if ($this->db->trans_status() === FALSE) {
+            $this->response(false, 'Failed to create group', null, 500);
+        }
+
+        // Notify added members via FCM
+        foreach ($added_user_ids as $uid) {
+            $this->send_fcm_notification($uid, $title, "{$current_user['name']} added you to group '{$title}'", [
+                'type'        => 'group_invite',
+                'group_id'    => (string)$group_id,
+                'group_title' => $title,
+                'group_icon'  => (string)($icon_url ?: '')
+            ]);
+        }
+
+        $this->response(true, 'Group created successfully', [
+            'id'           => $group_id,
+            'group_id'     => $group_id,
+            'title'        => $title,
+            'description'  => $description,
+            'icon'         => $icon_url,
+            'created_by'   => $my_id,
+            'member_count' => count($added_user_ids) + 1
+        ], 201);
+    }
+
+    /**
+     * GET api/groups
+     * Returns all groups where the authenticated user is an active member.
+     */
+    public function groups()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+
+        $sql = "SELECT g.id AS group_id, g.title, g.description, g.icon, g.created_by, g.updated_at,
+                       gm.role AS my_role, gm.last_read_message_id,
+                       m.id AS last_msg_id, m.sender_id AS last_msg_sender_id,
+                       m.message_type AS last_msg_type, m.message_text AS last_msg_text,
+                       m.media_url AS last_msg_media_url, m.created_at AS last_msg_time,
+                       u.name AS last_msg_sender_name,
+                       (SELECT COUNT(*) FROM `group_members` WHERE `group_id` = g.id AND `status` = 'active') AS member_count,
+                       (SELECT COUNT(*) FROM `group_members` WHERE `group_id` = g.id AND `status` = 'pending') AS pending_requests_count,
+                       (SELECT COUNT(*) FROM `messages` WHERE `group_id` = g.id AND `id` > gm.last_read_message_id) AS unread_count
+                FROM `group_members` gm
+                INNER JOIN `groups` g ON g.id = gm.group_id
+                LEFT JOIN `messages` m ON m.id = g.last_message_id
+                LEFT JOIN `users` u ON u.id = m.sender_id
+                WHERE gm.user_id = ? AND gm.status = 'active'
+                ORDER BY g.updated_at DESC";
+
+        $rows = $this->db->query($sql, [$my_id])->result_array();
+
+        $groups = [];
+        foreach ($rows as $r) {
+            $last_msg = null;
+            if (!empty($r['last_msg_id'])) {
+                $last_msg = [
+                    'id'           => (int)$r['last_msg_id'],
+                    'sender_id'    => (int)$r['last_msg_sender_id'],
+                    'sender_name'  => $r['last_msg_sender_name'] ?: 'Someone',
+                    'message_type' => $r['last_msg_type'],
+                    'message_text' => $r['last_msg_text'],
+                    'created_at'   => $r['last_msg_time']
+                ];
+            }
+
+            $groups[] = [
+                'id'                     => (int)$r['group_id'],
+                'group_id'               => (int)$r['group_id'],
+                'title'                  => $r['title'],
+                'description'            => $r['description'] ?: '',
+                'icon'                   => $r['icon'] ?: '',
+                'created_by'             => (int)$r['created_by'],
+                'my_role'                => $r['my_role'],
+                'member_count'           => (int)$r['member_count'],
+                'pending_requests_count' => ($r['my_role'] === 'admin') ? (int)$r['pending_requests_count'] : 0,
+                'unread_count'           => (int)$r['unread_count'],
+                'last_message'           => $last_msg,
+                'updated_at'             => $r['updated_at']
+            ];
+        }
+
+        $this->response(true, 'Groups retrieved successfully', [
+            'groups' => $groups
+        ], 200);
+    }
+
+    /**
+     * GET api/group_details
+     * Returns full metadata, member roster, and pending approval requests (for admins).
+     */
+    public function group_details()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+
+        // Verify membership
+        $my_membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $my_id)
+            ->get('group_members')
+            ->row_array();
+
+        if (!$my_membership || $my_membership['status'] !== 'active') {
+            $this->response(false, 'Access denied. You are not an active member of this group.', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        // Active members
+        $members_sql = "SELECT gm.id AS membership_id, gm.role, gm.joined_at,
+                               u.id AS user_id, u.name, u.email, u.mobile, u.profile_image,
+                               u.about, u.is_online, u.last_seen
+                        FROM group_members gm
+                        INNER JOIN users u ON u.id = gm.user_id
+                        WHERE gm.group_id = ? AND gm.status = 'active'
+                        ORDER BY (gm.role = 'admin') DESC, u.name ASC";
+        $members = $this->db->query($members_sql, [$group_id])->result_array();
+
+        // Pending approval requests (only visible to admins)
+        $pending_requests = [];
+        if ($my_membership['role'] === 'admin') {
+            $pending_sql = "SELECT gm.id AS request_id, gm.joined_at AS requested_at, gm.invited_by,
+                                   u.id AS user_id, u.name, u.email, u.mobile, u.profile_image,
+                                   inv.name AS invited_by_name
+                            FROM group_members gm
+                            INNER JOIN users u ON u.id = gm.user_id
+                            LEFT JOIN users inv ON inv.id = gm.invited_by
+                            WHERE gm.group_id = ? AND gm.status = 'pending'
+                            ORDER BY gm.joined_at ASC";
+            $pending_requests = $this->db->query($pending_sql, [$group_id])->result_array();
+        }
+
+        $this->response(true, 'Group details retrieved successfully', [
+            'group' => [
+                'id'                     => (int)$group['id'],
+                'group_id'               => (int)$group['id'],
+                'title'                  => $group['title'],
+                'description'            => $group['description'] ?: '',
+                'icon'                   => $group['icon'] ?: '',
+                'created_by'             => (int)$group['created_by'],
+                'created_at'             => $group['created_at'],
+                'my_role'                => $my_membership['role'],
+                'member_count'           => count($members),
+                'pending_requests_count' => count($pending_requests)
+            ],
+            'members'          => $members,
+            'pending_requests' => $pending_requests
+        ], 200);
+    }
+
+    /**
+     * POST api/send_group_message
+     * Sends a text message to a group and broadcasts FCM push notification
+     * to all other active members in the group.
+     */
+    public function send_group_message()
+    {
+        $current_user = $this->authenticate();
+        $sender_id    = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+        $message_text = trim((string)$this->get_input('message_text'));
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+        if ($message_text === '') {
+            $this->response(false, 'message_text cannot be empty', null, 422);
+        }
+
+        // Verify active membership
+        $membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $sender_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$membership) {
+            $this->response(false, 'You must be an active member of this group to send messages', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        $this->db->trans_start();
+
+        $msg_data = [
+            'conversation_id' => null,
+            'group_id'        => $group_id,
+            'sender_id'       => $sender_id,
+            'receiver_id'     => null,
+            'message_type'    => 'text',
+            'message_text'    => $message_text,
+            'media_url'       => null,
+            'media_size'      => 0,
+            'status'          => 'sent',
+            'created_at'      => $now
+        ];
+        $this->db->insert('messages', $msg_data);
+        $message_id = (int)$this->db->insert_id();
+
+        // Update group last message and timestamp
+        $this->db->where('id', $group_id)->update('groups', [
+            'last_message_id' => $message_id,
+            'updated_at'      => $now
+        ]);
+
+        // Mark sender as having read this message
+        $this->db->where('group_id', $group_id)
+            ->where('user_id', $sender_id)
+            ->update('group_members', [
+                'last_read_message_id' => $message_id
+            ]);
+
+        $this->db->trans_complete();
+
+        if ($this->db->trans_status() === FALSE) {
+            $this->response(false, 'Failed to save group message', null, 500);
+        }
+
+        $msg_data['id'] = $message_id;
+        $msg_data['sender_name']   = $current_user['name'];
+        $msg_data['sender_avatar'] = !empty($current_user['profile_image']) ? $current_user['profile_image'] : '';
+
+        // Broadcast FCM to all other active members
+        $this->broadcast_group_fcm($group_id, $sender_id, $group['title'], $current_user['name'] . ': ' . $message_text, [
+            'type'            => 'group_chat',
+            'group_id'        => (string)$group_id,
+            'group_title'     => (string)$group['title'],
+            'group_icon'      => (string)($group['icon'] ?: ''),
+            'sender_id'       => (string)$sender_id,
+            'sender_name'     => (string)$current_user['name'],
+            'sender_avatar'   => (string)($current_user['profile_image'] ?: ''),
+            'msg_type'        => 'text',
+            'message_id'      => (string)$message_id
+        ]);
+
+        $this->response(true, 'Group message sent successfully', [
+            'message' => $msg_data
+        ], 201);
+    }
+
+    /**
+     * POST api/send_group_media
+     * Uploads media (jpg/png/webp/mp4 <= 2MB) and sends to group.
+     */
+    public function send_group_media()
+    {
+        $current_user = $this->authenticate();
+        $sender_id    = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+        $caption      = trim((string)$this->get_input('caption', ''));
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+
+        $membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $sender_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$membership) {
+            $this->response(false, 'You must be an active member of this group', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+            $this->response(false, 'Media file is required', null, 422);
+        }
+
+        $file      = $_FILES['file'];
+        $file_size = (int)$file['size'];
+        $ext       = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+
+        if ($file_size > self::MAX_MEDIA_BYTES) {
+            $this->response(false, 'File size exceeds 2 MB limit', null, 413);
+        }
+
+        $allowed_images = ['jpg', 'jpeg', 'png', 'webp'];
+        $allowed_videos = ['mp4'];
+        $msg_type       = null;
+
+        if (in_array($ext, $allowed_images)) {
+            $msg_type = 'image';
+        } elseif (in_array($ext, $allowed_videos)) {
+            $msg_type = 'video';
+        } else {
+            $this->response(false, 'Unsupported file type. Allowed: jpg, jpeg, png, webp, mp4', null, 415);
+        }
+
+        $target_dir = FCPATH . self::UPLOAD_CHAT_DIR;
+        if (!is_dir($target_dir)) {
+            @mkdir($target_dir, 0755, true);
+        }
+
+        $filename       = 'grp_' . time() . '_' . rand(1000, 9999) . '.' . $ext;
+        $dest_path      = $target_dir . $filename;
+        $rel_media_url  = base_url(self::UPLOAD_CHAT_DIR . $filename);
+
+        if (!@move_uploaded_file($file['tmp_name'], $dest_path)) {
+            $this->response(false, 'Failed to save uploaded file', null, 500);
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        $this->db->trans_start();
+
+        $msg_data = [
+            'conversation_id' => null,
+            'group_id'        => $group_id,
+            'sender_id'       => $sender_id,
+            'receiver_id'     => null,
+            'message_type'    => $msg_type,
+            'message_text'    => $caption !== '' ? $caption : null,
+            'media_url'       => $rel_media_url,
+            'media_size'      => $file_size,
+            'status'          => 'sent',
+            'created_at'      => $now
+        ];
+        $this->db->insert('messages', $msg_data);
+        $message_id = (int)$this->db->insert_id();
+
+        $this->db->where('id', $group_id)->update('groups', [
+            'last_message_id' => $message_id,
+            'updated_at'      => $now
+        ]);
+
+        $this->db->where('group_id', $group_id)
+            ->where('user_id', $sender_id)
+            ->update('group_members', [
+                'last_read_message_id' => $message_id
+            ]);
+
+        $this->db->trans_complete();
+
+        if ($this->db->trans_status() === FALSE) {
+            $this->response(false, 'Failed to record media message', null, 500);
+        }
+
+        $msg_data['id'] = $message_id;
+        $msg_data['sender_name']   = $current_user['name'];
+        $msg_data['sender_avatar'] = !empty($current_user['profile_image']) ? $current_user['profile_image'] : '';
+
+        $push_body = ($msg_type === 'image') ? '📷 Photo' : '🎥 Video';
+        if (!empty($caption)) {
+            $push_body .= ': ' . $caption;
+        }
+
+        $this->broadcast_group_fcm($group_id, $sender_id, $group['title'], $current_user['name'] . ': ' . $push_body, [
+            'type'            => 'group_chat',
+            'group_id'        => (string)$group_id,
+            'group_title'     => (string)$group['title'],
+            'group_icon'      => (string)($group['icon'] ?: ''),
+            'sender_id'       => (string)$sender_id,
+            'sender_name'     => (string)$current_user['name'],
+            'sender_avatar'   => (string)($current_user['profile_image'] ?: ''),
+            'msg_type'        => $msg_type,
+            'message_id'      => (string)$message_id
+        ]);
+
+        $this->response(true, 'Media sent successfully to group', [
+            'message'   => $msg_data,
+            'media_url' => $rel_media_url
+        ], 201);
+    }
+
+    /**
+     * GET api/group_messages
+     * Fetches message history for a group with sender names and avatars.
+     */
+    public function group_messages()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+        $after_id     = (int)$this->get_input('after_id', 0);
+        $limit        = min(max((int)$this->get_input('limit', 50), 1), 100);
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+
+        $membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $my_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$membership) {
+            $this->response(false, 'Access denied. You are not an active member of this group.', null, 403);
+        }
+
+        $this->db->select('m.*, u.name AS sender_name, u.profile_image AS sender_avatar')
+            ->from('messages m')
+            ->join('users u', 'u.id = m.sender_id', 'inner')
+            ->where('m.group_id', $group_id);
+
+        if ($after_id > 0) {
+            $this->db->where('m.id >', $after_id);
+        }
+
+        $messages = $this->db->order_by('m.id', 'ASC')
+            ->limit($limit)
+            ->get()
+            ->result_array();
+
+        // Filter soft-deleted messages
+        $clean_msgs = [];
+        foreach ($messages as $m) {
+            if ((int)$m['is_deleted'] === 1) {
+                $m['message_text'] = 'This message was deleted';
+                $m['media_url']    = null;
+            }
+            $clean_msgs[] = $m;
+        }
+
+        // Auto mark as read
+        if (!empty($clean_msgs)) {
+            $latest_id = (int)end($clean_msgs)['id'];
+            if ($latest_id > (int)$membership['last_read_message_id']) {
+                $this->db->where('group_id', $group_id)
+                    ->where('user_id', $my_id)
+                    ->update('group_members', [
+                        'last_read_message_id' => $latest_id
+                    ]);
+            }
+        }
+
+        $this->response(true, 'Group messages retrieved successfully', [
+            'group_id' => $group_id,
+            'messages' => $clean_msgs
+        ], 200);
+    }
+
+    /**
+     * POST api/add_group_members
+     * Adds members to a group.
+     * - If caller is ADMIN: Member is added immediately with status='active' (No permission needed!).
+     * - If caller is REGULAR MEMBER: Member is added with status='pending' (Awaiting admin approval).
+     */
+    public function add_group_members()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+        $user_ids     = $this->get_input('user_ids');
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+        if (empty($user_ids)) {
+            $this->response(false, 'user_ids is required', null, 422);
+        }
+
+        $my_membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $my_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$my_membership) {
+            $this->response(false, 'You must be an active member of this group', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        $is_admin = ($my_membership['role'] === 'admin');
+        $status_to_assign = $is_admin ? 'active' : 'pending';
+
+        $ids = is_array($user_ids) ? $user_ids : explode(',', (string)$user_ids);
+        $added_active = [];
+        $added_pending = [];
+        $now = date('Y-m-d H:i:s');
+
+        foreach ($ids as $id) {
+            $uid = (int)trim($id);
+            if ($uid <= 0) continue;
+
+            $exists = $this->db->where('group_id', $group_id)
+                ->where('user_id', $uid)
+                ->get('group_members')
+                ->row_array();
+
+            if ($exists) {
+                if ($exists['status'] === 'pending' && $is_admin) {
+                    // Admin is adding a pending user -> approve them directly!
+                    $this->db->where('id', $exists['id'])->update('group_members', [
+                        'status'    => 'active',
+                        'joined_at' => $now
+                    ]);
+                    $added_active[] = $uid;
+                }
+                continue;
+            }
+
+            $user = $this->db->where('id', $uid)->get('users')->row_array();
+            if ($user) {
+                $this->db->insert('group_members', [
+                    'group_id'             => $group_id,
+                    'user_id'              => $uid,
+                    'role'                 => 'member',
+                    'status'               => $status_to_assign,
+                    'invited_by'           => $my_id,
+                    'last_read_message_id' => 0,
+                    'joined_at'            => $now
+                ]);
+
+                if ($is_admin) {
+                    $added_active[] = $uid;
+                    // Notify added user directly
+                    $this->send_fcm_notification($uid, $group['title'], "{$current_user['name']} added you to group '{$group['title']}'", [
+                        'type'        => 'group_invite',
+                        'group_id'    => (string)$group_id,
+                        'group_title' => (string)$group['title'],
+                        'group_icon'  => (string)($group['icon'] ?: '')
+                    ]);
+                } else {
+                    $added_pending[] = $uid;
+                }
+            }
+        }
+
+        // If regular member invited users, notify group admins about pending approval requests
+        if (!$is_admin && !empty($added_pending)) {
+            $admins = $this->db->where('group_id', $group_id)
+                ->where('role', 'admin')
+                ->where('status', 'active')
+                ->get('group_members')
+                ->result_array();
+
+            foreach ($admins as $adm) {
+                $this->send_fcm_notification($adm['user_id'], $group['title'], "{$current_user['name']} invited new members awaiting your approval", [
+                    'type'        => 'group_join_request',
+                    'group_id'    => (string)$group_id,
+                    'group_title' => (string)$group['title']
+                ]);
+            }
+        }
+
+        $message = $is_admin
+            ? count($added_active) . ' member(s) added successfully without approval'
+            : count($added_pending) . ' member(s) invited; awaiting admin approval';
+
+        $this->response(true, $message, [
+            'added_active'      => $added_active,
+            'added_pending'     => $added_pending,
+            'requires_approval' => !$is_admin
+        ], 200);
+    }
+
+    /**
+     * POST api/approve_group_member
+     * Approves or rejects a pending member request. Only callable by Group Admins.
+     */
+    public function approve_group_member()
+    {
+        $current_user   = $this->authenticate();
+        $admin_id       = (int)$current_user['id'];
+        $group_id       = (int)$this->get_input('group_id');
+        $target_user_id = (int)$this->get_input('target_user_id');
+        $action         = strtolower(trim((string)$this->get_input('action', 'approve')));
+
+        if (empty($group_id) || empty($target_user_id)) {
+            $this->response(false, 'group_id and target_user_id are required', null, 422);
+        }
+
+        // Verify caller is admin
+        $admin_check = $this->db->where('group_id', $group_id)
+            ->where('user_id', $admin_id)
+            ->where('role', 'admin')
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$admin_check) {
+            $this->response(false, 'Permission denied. Only group admins can approve or reject members.', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        $pending_record = $this->db->where('group_id', $group_id)
+            ->where('user_id', $target_user_id)
+            ->where('status', 'pending')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$pending_record) {
+            $this->response(false, 'No pending join request found for this user in this group', null, 404);
+        }
+
+        if ($action === 'approve') {
+            $this->db->where('id', $pending_record['id'])->update('group_members', [
+                'status'    => 'active',
+                'joined_at' => date('Y-m-d H:i:s')
+            ]);
+
+            // Notify user
+            $this->send_fcm_notification($target_user_id, $group['title'], "Your request to join '{$group['title']}' was approved by admin", [
+                'type'        => 'group_approved',
+                'group_id'    => (string)$group_id,
+                'group_title' => (string)$group['title'],
+                'group_icon'  => (string)($group['icon'] ?: '')
+            ]);
+
+            $this->response(true, 'Member approved successfully and added to group', null, 200);
+        } else {
+            $this->db->where('id', $pending_record['id'])->delete('group_members');
+            $this->response(true, 'Join request rejected and removed', null, 200);
+        }
+    }
+
+    /**
+     * POST api/update_member_role
+     * Promotes a member to Admin or demotes an Admin to Member.
+     * Admin stays as admin as well when promoting others!
+     */
+    public function update_member_role()
+    {
+        $current_user   = $this->authenticate();
+        $admin_id       = (int)$current_user['id'];
+        $group_id       = (int)$this->get_input('group_id');
+        $target_user_id = (int)$this->get_input('target_user_id');
+        $new_role       = strtolower(trim((string)$this->get_input('role')));
+
+        if (empty($group_id) || empty($target_user_id) || !in_array($new_role, ['admin', 'member'])) {
+            $this->response(false, 'group_id, target_user_id, and valid role (admin/member) are required', null, 422);
+        }
+
+        // Verify caller is admin
+        $admin_check = $this->db->where('group_id', $group_id)
+            ->where('user_id', $admin_id)
+            ->where('role', 'admin')
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$admin_check) {
+            $this->response(false, 'Only group admins can change member roles', null, 403);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        $target = $this->db->where('group_id', $group_id)
+            ->where('user_id', $target_user_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        if (!$target) {
+            $this->response(false, 'Target user is not an active member of this group', null, 404);
+        }
+
+        // Prevent demoting group creator
+        if ($target_user_id === (int)$group['created_by'] && $new_role === 'member') {
+            $this->response(false, 'The group creator cannot be demoted from admin', null, 400);
+        }
+
+        $this->db->where('id', $target['id'])->update('group_members', [
+            'role' => $new_role
+        ]);
+
+        // Notify user about their role change
+        $role_text = ($new_role === 'admin') ? 'Group Admin' : 'Member';
+        $this->send_fcm_notification($target_user_id, $group['title'], "You are now a {$role_text} of '{$group['title']}'", [
+            'type'        => 'group_role_update',
+            'group_id'    => (string)$group_id,
+            'group_title' => (string)$group['title'],
+            'new_role'    => $new_role
+        ]);
+
+        $this->response(true, "Member role updated to {$new_role} successfully", [
+            'target_user_id' => $target_user_id,
+            'role'           => $new_role
+        ], 200);
+    }
+
+    /**
+     * POST api/remove_group_member
+     * Removes a member from group (or allows user to leave).
+     */
+    public function remove_group_member()
+    {
+        $current_user   = $this->authenticate();
+        $caller_id      = (int)$current_user['id'];
+        $group_id       = (int)$this->get_input('group_id');
+        $target_user_id = (int)$this->get_input('target_user_id');
+
+        if (empty($group_id) || empty($target_user_id)) {
+            $this->response(false, 'group_id and target_user_id are required', null, 422);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        $target = $this->db->where('group_id', $group_id)
+            ->where('user_id', $target_user_id)
+            ->get('group_members')
+            ->row_array();
+
+        if (!$target) {
+            $this->response(false, 'Member not found in group', null, 404);
+        }
+
+        if ($caller_id !== $target_user_id) {
+            // Admin removing someone
+            $caller_membership = $this->db->where('group_id', $group_id)
+                ->where('user_id', $caller_id)
+                ->where('role', 'admin')
+                ->where('status', 'active')
+                ->get('group_members')
+                ->row_array();
+
+            if (!$caller_membership) {
+                $this->response(false, 'Only group admins can remove other members', null, 403);
+            }
+
+            if ($target_user_id === (int)$group['created_by']) {
+                $this->response(false, 'The group creator cannot be removed', null, 400);
+            }
+        }
+
+        $this->db->where('id', $target['id'])->delete('group_members');
+
+        // If creator left and other members exist, promote the oldest active member to admin
+        if ($target_user_id === (int)$group['created_by']) {
+            $next_admin = $this->db->where('group_id', $group_id)
+                ->where('status', 'active')
+                ->order_by('joined_at', 'ASC')
+                ->get('group_members')
+                ->row_array();
+
+            if ($next_admin) {
+                $this->db->where('id', $next_admin['id'])->update('group_members', [
+                    'role' => 'admin'
+                ]);
+            }
+        }
+
+        $this->response(true, 'Member removed from group successfully', null, 200);
+    }
+
+    /**
+     * POST api/mark_group_read
+     * Marks all messages in group as read for current user.
+     */
+    public function mark_group_read()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+
+        $max_msg = $this->db->select_max('id')
+            ->where('group_id', $group_id)
+            ->get('messages')
+            ->row_array();
+
+        $latest_id = (int)($max_msg['id'] ?? 0);
+
+        if ($latest_id > 0) {
+            $this->db->where('group_id', $group_id)
+                ->where('user_id', $my_id)
+                ->update('group_members', [
+                    'last_read_message_id' => $latest_id
+                ]);
+        }
+
+        $this->response(true, 'Group marked as read', [
+            'group_id'             => $group_id,
+            'last_read_message_id' => $latest_id
+        ], 200);
+    }
+
+    /**
+     * Broadcasts an FCM push notification to all active members of a group except the sender.
+     */
+    private function broadcast_group_fcm($group_id, $sender_id, $title, $body, array $data = [])
+    {
+        try {
+            $members = $this->db->select('user_id')
+                ->where('group_id', (int)$group_id)
+                ->where('status', 'active')
+                ->where('user_id !=', (int)$sender_id)
+                ->get('group_members')
+                ->result_array();
+
+            if (empty($members)) {
+                return;
+            }
+
+            $user_ids = array_column($members, 'user_id');
+
+            $tokens = $this->db->select('id, user_id, fcm_token')
+                ->where_in('user_id', $user_ids)
+                ->get('device_tokens')
+                ->result_array();
+
+            if (empty($tokens)) {
+                return;
+            }
+
+            $access_token = $this->get_fcm_access_token();
+            if (!$access_token) {
+                return;
+            }
+
+            $string_data = [];
+            foreach ($data as $k => $v) {
+                $string_data[(string)$k] = (string)$v;
+            }
+
+            $url = 'https://fcm.googleapis.com/v1/projects/' . self::FCM_PROJECT_ID . '/messages:send';
+
+            foreach ($tokens as $t) {
+                $payload = [
+                    'message' => [
+                        'token'        => $t['fcm_token'],
+                        'notification' => [
+                            'title' => (string)$title,
+                            'body'  => (string)$body
+                        ],
+                        'data'         => $string_data,
+                        'android'      => [
+                            'priority'     => 'HIGH',
+                            'notification' => [
+                                'channel_id'              => 'chat_messages',
+                                'sound'                   => 'default',
+                                'default_sound'           => true,
+                                'default_vibrate_timings' => true,
+                                'notification_priority'   => 'PRIORITY_MAX',
+                                'visibility'              => 'PUBLIC'
+                            ]
+                        ]
+                    ]
+                ];
+
+                $ch = curl_init($url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+                curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                    'Authorization: Bearer ' . $access_token,
+                    'Content-Type: application/json; UTF-8'
+                ]);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+
+                $response  = curl_exec($ch);
+                $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curl_err  = curl_error($ch);
+                curl_close($ch);
+
+                $resp_str = $curl_err ? 'CURL Error: ' . $curl_err : $response;
+
+                // Log response
+                $this->db->insert('notification_logs', [
+                    'user_id'      => (int)$t['user_id'],
+                    'title'        => (string)$title,
+                    'body'         => (string)$body,
+                    'fcm_response' => substr($resp_str, 0, 4000),
+                    'created_at'   => date('Y-m-d H:i:s')
+                ]);
+
+                // Auto clean up dead tokens
+                if ($http_code === 404 || strpos($resp_str, 'UNREGISTERED') !== false) {
+                    $this->db->where('id', $t['id'])->delete('device_tokens');
+                }
+            }
+        } catch (\Throwable $e) {
+            log_message('error', 'Group FCM Broadcast Exception: ' . $e->getMessage());
+        }
+    }
+
 
 
 
@@ -1671,8 +2664,51 @@ class Api extends CI_Controller
         $schema_checked = true;
 
         try {
+            // 1. Ensure groups table exists
+            if (!$this->db->table_exists('groups')) {
+                $this->db->query("CREATE TABLE IF NOT EXISTS `groups` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `title` VARCHAR(150) NOT NULL,
+                    `description` TEXT NULL,
+                    `icon` VARCHAR(255) NULL,
+                    `created_by` INT NOT NULL,
+                    `last_message_id` INT NULL,
+                    `created_at` DATETIME NOT NULL,
+                    `updated_at` DATETIME NOT NULL,
+                    INDEX (`created_by`),
+                    INDEX (`updated_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            }
+
+            // 2. Ensure group_members table exists
+            if (!$this->db->table_exists('group_members')) {
+                $this->db->query("CREATE TABLE IF NOT EXISTS `group_members` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `group_id` INT NOT NULL,
+                    `user_id` INT NOT NULL,
+                    `role` ENUM('admin', 'member') DEFAULT 'member',
+                    `status` ENUM('active', 'pending') DEFAULT 'active',
+                    `invited_by` INT NULL,
+                    `last_read_message_id` INT DEFAULT 0,
+                    `joined_at` DATETIME NOT NULL,
+                    UNIQUE KEY `uniq_group_user` (`group_id`, `user_id`),
+                    INDEX (`user_id`, `status`),
+                    INDEX (`group_id`, `status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            }
+
+            // 3. Ensure messages table supports group chat & edits
             if ($this->db->table_exists('messages')) {
                 $fields = $this->db->list_fields('messages');
+                if (!in_array('group_id', $fields)) {
+                    $this->db->query("ALTER TABLE `messages` ADD COLUMN `group_id` INT(10) UNSIGNED NULL AFTER `conversation_id`, ADD INDEX (`group_id`)");
+                    try { $this->db->query("ALTER TABLE `messages` DROP FOREIGN KEY `fk_messages_receiver`"); } catch (\Throwable $e) {}
+                    try { $this->db->query("ALTER TABLE `messages` DROP FOREIGN KEY `fk_messages_conversation`"); } catch (\Throwable $e) {}
+                    $this->db->query("ALTER TABLE `messages` MODIFY `receiver_id` INT(10) UNSIGNED NULL");
+                    $this->db->query("ALTER TABLE `messages` MODIFY `conversation_id` INT(10) UNSIGNED NULL");
+                    try { $this->db->query("ALTER TABLE `messages` ADD CONSTRAINT `fk_messages_receiver` FOREIGN KEY (`receiver_id`) REFERENCES `users` (`id`) ON DELETE CASCADE"); } catch (\Throwable $e) {}
+                    try { $this->db->query("ALTER TABLE `messages` ADD CONSTRAINT `fk_messages_conversation` FOREIGN KEY (`conversation_id`) REFERENCES `conversations` (`id`) ON DELETE CASCADE"); } catch (\Throwable $e) {}
+                }
                 if (!in_array('is_edited', $fields)) {
                     $this->db->query("ALTER TABLE `messages` ADD COLUMN `is_edited` TINYINT(1) NOT NULL DEFAULT 0");
                 }
@@ -1910,7 +2946,10 @@ class Api extends CI_Controller
                     'created_at'   => date('Y-m-d H:i:s')
                 ]);
 
-                // FCM device tokens are preserved permanently and ONLY removed upon explicit user logout
+                // Clean up dead tokens that Google explicitly confirmed are UNREGISTERED (app uninstalled / replaced)
+                if ($http_code === 404 || strpos($resp_str, 'UNREGISTERED') !== false) {
+                    $this->db->where('id', $t['id'])->delete('device_tokens');
+                }
             }
         } catch (\Throwable $e) {
             log_message('error', 'FCM Notification Exception: ' . $e->getMessage());
@@ -1936,7 +2975,7 @@ class Api extends CI_Controller
                 return;
             }
 
-            $tokens = $this->db->select('user_id, fcm_token')
+            $tokens = $this->db->select('id, user_id, fcm_token')
                 ->where('user_id !=', (int)$exclude_user_id)
                 ->get('device_tokens')
                 ->result_array();
@@ -2002,7 +3041,10 @@ class Api extends CI_Controller
                     'created_at'   => date('Y-m-d H:i:s')
                 ]);
 
-                // FCM device tokens are preserved permanently and ONLY removed upon explicit user logout
+                // Clean up dead tokens that Google explicitly confirmed are UNREGISTERED (app uninstalled / replaced)
+                if ($http_code === 404 || strpos($resp_str, 'UNREGISTERED') !== false) {
+                    $this->db->where('id', $t['id'])->delete('device_tokens');
+                }
             }
         } catch (\Throwable $e) {
             log_message('error', 'FCM Broadcast Exception: ' . $e->getMessage());
