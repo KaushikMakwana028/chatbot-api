@@ -2200,6 +2200,103 @@ class Api extends CI_Controller
     }
 
     /**
+     * POST api/update_group
+     * Updates group title, description, or group icon.
+     * Accessible by group admins and group creator.
+     */
+    public function update_group()
+    {
+        $current_user = $this->authenticate();
+        $my_id        = (int)$current_user['id'];
+        $group_id     = (int)$this->get_input('group_id');
+        $title        = $this->get_input('title');
+        $description  = $this->get_input('description');
+
+        if (empty($group_id)) {
+            $this->response(false, 'group_id is required', null, 422);
+        }
+
+        $group = $this->db->where('id', $group_id)->get('groups')->row_array();
+        if (!$group) {
+            $this->response(false, 'Group not found', null, 404);
+        }
+
+        // Verify user is an active admin or creator of the group
+        $membership = $this->db->where('group_id', $group_id)
+            ->where('user_id', $my_id)
+            ->where('status', 'active')
+            ->get('group_members')
+            ->row_array();
+
+        $is_creator = ((int)$group['created_by'] === $my_id);
+        $is_admin   = ($membership && $membership['role'] === 'admin');
+
+        if (!$is_creator && !$is_admin) {
+            $this->response(false, 'Only group admins can update group information', null, 403);
+        }
+
+        $updates = [];
+
+        if ($title !== null && trim($title) !== '') {
+            $updates['title'] = trim($title);
+        }
+
+        if ($description !== null) {
+            $updates['description'] = trim($description);
+        }
+
+        // Handle group icon upload if multipart file provided
+        if (isset($_FILES['icon']) && $_FILES['icon']['error'] === UPLOAD_ERR_OK) {
+            $ext = strtolower(pathinfo($_FILES['icon']['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
+                $dir = FCPATH . 'uploads/group_icons/';
+                if (!is_dir($dir)) {
+                    @mkdir($dir, 0755, true);
+                }
+                $filename = 'grp_' . time() . '_' . rand(1000, 9999) . '.' . $ext;
+                if (@move_uploaded_file($_FILES['icon']['tmp_name'], $dir . $filename)) {
+                    $updates['icon'] = base_url('uploads/group_icons/' . $filename);
+                }
+            }
+        } elseif ($this->get_input('icon')) {
+            $updates['icon'] = trim($this->get_input('icon'));
+        }
+
+        if (empty($updates)) {
+            $this->response(false, 'No fields provided to update', null, 422);
+        }
+
+        $updates['updated_at'] = date('Y-m-d H:i:s');
+        $this->db->where('id', $group_id)->update('groups', $updates);
+
+        $updated_group = $this->db->where('id', $group_id)->get('groups')->row_array();
+
+        // Broadcast notification to group members
+        $action_text = !empty($updates['title']) ? "renamed the group to '{$updated_group['title']}'" : "updated group info";
+        $this->broadcast_group_fcm(
+            $group_id,
+            $my_id,
+            $updated_group['title'],
+            "{$current_user['name']} {$action_text}",
+            [
+                'type'        => 'group_updated',
+                'group_id'    => (string)$group_id,
+                'title'       => (string)$updated_group['title'],
+                'icon'        => (string)($updated_group['icon'] ?: ''),
+                'description' => (string)($updated_group['description'] ?: '')
+            ]
+        );
+
+        $this->response(true, 'Group updated successfully', [
+            'group_id'    => (int)$updated_group['id'],
+            'title'       => $updated_group['title'],
+            'description' => $updated_group['description'] ?: '',
+            'icon'        => $updated_group['icon'] ?: '',
+            'updated_at'  => $updated_group['updated_at']
+        ], 200);
+    }
+
+    /**
      * POST api/mark_group_read
      * Marks all messages in group as read for current user.
      */
@@ -2265,14 +2362,32 @@ class Api extends CI_Controller
             $this->response(false, 'Receiver not found', null, 404);
         }
 
-        // Check if receiver is already in an active call
+        // Auto-expire stale ringing calls older than 30 seconds
+        $this->db->query("
+            UPDATE `calls`
+            SET status = 'missed', ended_at = NOW(), updated_at = NOW()
+            WHERE status = 'ringing'
+              AND created_at < DATE_SUB(NOW(), INTERVAL 30 SECOND)
+        ");
+
+        // If caller previously dialed this receiver and it's still ringing, cancel prior ringing attempt
+        $this->db->query("
+            UPDATE `calls`
+            SET status = 'cancelled', ended_at = NOW(), updated_at = NOW()
+            WHERE caller_id = ? AND receiver_id = ? AND status = 'ringing'
+        ", [$my_id, $receiver_id]);
+
+        // Check if receiver is already in an active connected call (accepted)
+        // OR ringing with someone else in the last 25 seconds
         $busy_check = $this->db->query("
             SELECT id FROM `calls`
             WHERE (receiver_id = ? OR caller_id = ?)
-              AND status IN ('ringing', 'accepted')
-              AND updated_at >= DATE_SUB(NOW(), INTERVAL 60 SECOND)
+              AND (
+                status = 'accepted'
+                OR (status = 'ringing' AND updated_at >= DATE_SUB(NOW(), INTERVAL 25 SECOND) AND caller_id != ?)
+              )
             LIMIT 1
-        ", [$receiver_id, $receiver_id])->row_array();
+        ", [$receiver_id, $receiver_id, $my_id])->row_array();
 
         if ($busy_check) {
             $this->db->insert('calls', [
@@ -2379,6 +2494,22 @@ class Api extends CI_Controller
             'updated_at' => $now
         ]);
 
+        // Insert answer signal into call_signals so caller picks it up immediately
+        $this->db->insert('call_signals', [
+            'call_id'    => $call_id,
+            'sender_id'  => $my_id,
+            'type'       => 'answer',
+            'payload'    => json_encode(['answer_sdp' => $answer_sdp ?: '']),
+            'created_at' => $now
+        ]);
+
+        // High priority FCM push event so caller transitions to connected without waiting
+        $this->send_fcm_notification((int)$call['caller_id'], 'Call Accepted', 'Call accepted', [
+            'type'       => 'call_accepted',
+            'call_id'    => (string)$call_id,
+            'answer_sdp' => (string)($answer_sdp ?: '')
+        ]);
+
         $this->response(true, 'Call accepted', [
             'call_id'    => $call_id,
             'status'     => 'accepted',
@@ -2396,7 +2527,7 @@ class Api extends CI_Controller
         $my_id        = (int)$current_user['id'];
         $call_id      = (int)$this->get_input('call_id');
         $reason       = strtolower(trim((string)$this->get_input('reason')));
-        $final_status = in_array($reason, ['busy', 'missed', 'rejected']) ? $reason : 'rejected';
+        $final_status = in_array($reason, ['busy', 'missed', 'rejected', 'cancelled']) ? $reason : 'rejected';
 
         if (empty($call_id)) {
             $this->response(false, 'call_id is required', null, 422);
@@ -2416,6 +2547,25 @@ class Api extends CI_Controller
             'status'     => $final_status,
             'ended_at'   => $now,
             'updated_at' => $now
+        ]);
+
+        // Record call entry into chat conversation like WhatsApp
+        $this->log_call_as_chat_message(
+            $call_id,
+            (int)$call['caller_id'],
+            (int)$call['receiver_id'],
+            $call['call_type'],
+            $final_status,
+            0
+        );
+
+        // Notify other user via FCM so their ringing or active call UI closes immediately
+        $other_user_id = ((int)$call['caller_id'] === $my_id) ? (int)$call['receiver_id'] : (int)$call['caller_id'];
+        $this->send_fcm_notification($other_user_id, 'Call Status', "Call {$final_status}", [
+            'type'       => 'call_rejected',
+            'call_id'    => (string)$call_id,
+            'reason'     => (string)$final_status,
+            'by_user_id' => (string)$my_id
         ]);
 
         $this->response(true, "Call marked as {$final_status}", [
@@ -2460,6 +2610,16 @@ class Api extends CI_Controller
             'updated_at'       => $now
         ]);
 
+        // Record call entry into chat conversation like WhatsApp
+        $this->log_call_as_chat_message(
+            $call_id,
+            (int)$call['caller_id'],
+            (int)$call['receiver_id'],
+            $call['call_type'],
+            'ended',
+            $duration
+        );
+
         // Insert hangup signal so peer disconnects immediately
         $this->db->insert('call_signals', [
             'call_id'    => $call_id,
@@ -2467,6 +2627,14 @@ class Api extends CI_Controller
             'type'       => 'hangup',
             'payload'    => json_encode(['by_user_id' => $my_id]),
             'created_at' => $now
+        ]);
+
+        // Push FCM hangup event to other user
+        $other_user_id = ((int)$call['caller_id'] === $my_id) ? (int)$call['receiver_id'] : (int)$call['caller_id'];
+        $this->send_fcm_notification($other_user_id, 'Call Ended', 'Call ended', [
+            'type'       => 'call_ended',
+            'call_id'    => (string)$call_id,
+            'by_user_id' => (string)$my_id
         ]);
 
         $this->response(true, 'Call ended', [
@@ -2499,16 +2667,24 @@ class Api extends CI_Controller
             $this->response(false, 'Not authorized for this call', null, 403);
         }
 
-        // Auto-mark missed if ringing for more than 45 seconds without answer
+        // Auto-mark missed if ringing for more than 75 seconds without answer
         if ($call['status'] === 'ringing') {
             $created_ts = strtotime($call['created_at']);
-            if (time() - $created_ts > 45) {
+            if (time() - $created_ts > 75) {
                 $now = date('Y-m-d H:i:s');
                 $this->db->where('id', $call_id)->update('calls', [
                     'status'     => 'missed',
                     'ended_at'   => $now,
                     'updated_at' => $now
                 ]);
+                $this->log_call_as_chat_message(
+                    $call_id,
+                    (int)$call['caller_id'],
+                    (int)$call['receiver_id'],
+                    $call['call_type'],
+                    'missed',
+                    0
+                );
                 $call['status'] = 'missed';
             }
         }
@@ -2645,6 +2821,46 @@ class Api extends CI_Controller
         $this->response(true, 'Call logs retrieved', [
             'calls' => $calls
         ], 200);
+    }
+
+    /**
+     * Logs call events (ended, missed, rejected) as inline chat messages
+     * so they appear directly in the conversation like WhatsApp.
+     */
+    private function log_call_as_chat_message($call_id, $caller_id, $receiver_id, $call_type, $status, $duration_seconds = 0)
+    {
+        try {
+            $conv_id = $this->get_or_create_conversation((int)$caller_id, (int)$receiver_id);
+            if (!$conv_id) return;
+
+            $now = date('Y-m-d H:i:s');
+            $call_meta = json_encode([
+                'call_id'          => (int)$call_id,
+                'call_type'        => $call_type,
+                'status'           => $status,
+                'duration_seconds' => (int)$duration_seconds,
+            ]);
+
+            $this->db->insert('messages', [
+                'conversation_id' => $conv_id,
+                'sender_id'       => (int)$caller_id,
+                'receiver_id'     => (int)$receiver_id,
+                'message_type'    => 'call',
+                'message_text'    => $call_meta,
+                'media_url'       => null,
+                'media_size'      => 0,
+                'status'          => 'delivered',
+                'created_at'      => $now
+            ]);
+            $msg_id = (int)$this->db->insert_id();
+
+            $this->db->where('id', $conv_id)->update('conversations', [
+                'last_message_id' => $msg_id,
+                'updated_at'      => $now
+            ]);
+        } catch (\Throwable $e) {
+            log_message('error', 'log_call_as_chat_message failed: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -3107,6 +3323,33 @@ class Api extends CI_Controller
                     INDEX (`created_by`),
                     INDEX (`updated_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            } else {
+                $fields = $this->db->list_fields('groups');
+                if (!in_array('title', $fields)) {
+                    if (in_array('name', $fields)) {
+                        $this->db->query("ALTER TABLE `groups` CHANGE `name` `title` VARCHAR(150) NOT NULL");
+                    } else {
+                        $this->db->query("ALTER TABLE `groups` ADD COLUMN `title` VARCHAR(150) NOT NULL");
+                    }
+                }
+                if (!in_array('description', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `description` TEXT NULL");
+                }
+                if (!in_array('icon', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `icon` VARCHAR(255) NULL");
+                }
+                if (!in_array('created_by', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `created_by` INT NOT NULL");
+                }
+                if (!in_array('last_message_id', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `last_message_id` INT NULL");
+                }
+                if (!in_array('created_at', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `created_at` DATETIME NOT NULL");
+                }
+                if (!in_array('updated_at', $fields)) {
+                    $this->db->query("ALTER TABLE `groups` ADD COLUMN `updated_at` DATETIME NOT NULL");
+                }
             }
 
             // 2. Ensure group_members table exists
@@ -3124,6 +3367,23 @@ class Api extends CI_Controller
                     INDEX (`user_id`, `status`),
                     INDEX (`group_id`, `status`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            } else {
+                $gm_fields = $this->db->list_fields('group_members');
+                if (!in_array('role', $gm_fields)) {
+                    $this->db->query("ALTER TABLE `group_members` ADD COLUMN `role` ENUM('admin', 'member') DEFAULT 'member'");
+                }
+                if (!in_array('status', $gm_fields)) {
+                    $this->db->query("ALTER TABLE `group_members` ADD COLUMN `status` ENUM('active', 'pending') DEFAULT 'active'");
+                }
+                if (!in_array('invited_by', $gm_fields)) {
+                    $this->db->query("ALTER TABLE `group_members` ADD COLUMN `invited_by` INT NULL");
+                }
+                if (!in_array('last_read_message_id', $gm_fields)) {
+                    $this->db->query("ALTER TABLE `group_members` ADD COLUMN `last_read_message_id` INT DEFAULT 0");
+                }
+                if (!in_array('joined_at', $gm_fields)) {
+                    $this->db->query("ALTER TABLE `group_members` ADD COLUMN `joined_at` DATETIME NOT NULL");
+                }
             }
 
             // 3. Ensure messages table supports group chat & edits
@@ -3153,6 +3413,9 @@ class Api extends CI_Controller
                 if (!in_array('deleted_by_receiver', $fields)) {
                     $this->db->query("ALTER TABLE `messages` ADD COLUMN `deleted_by_receiver` TINYINT(1) NOT NULL DEFAULT 0");
                 }
+                try {
+                    $this->db->query("ALTER TABLE `messages` MODIFY COLUMN `message_type` VARCHAR(32) NOT NULL DEFAULT 'text'");
+                } catch (\Throwable $e) {}
             }
 
             // 4. Ensure calls table exists for 1-to-1 WebRTC audio/video calls
@@ -3162,7 +3425,7 @@ class Api extends CI_Controller
                     `caller_id` INT(10) UNSIGNED NOT NULL,
                     `receiver_id` INT(10) UNSIGNED NOT NULL,
                     `call_type` ENUM('audio', 'video') NOT NULL DEFAULT 'audio',
-                    `status` ENUM('ringing', 'accepted', 'rejected', 'missed', 'ended', 'busy') NOT NULL DEFAULT 'ringing',
+                    `status` ENUM('ringing', 'accepted', 'rejected', 'missed', 'ended', 'busy', 'cancelled') NOT NULL DEFAULT 'ringing',
                     `offer_sdp` MEDIUMTEXT NULL,
                     `answer_sdp` MEDIUMTEXT NULL,
                     `started_at` DATETIME NULL DEFAULT NULL,
@@ -3174,6 +3437,10 @@ class Api extends CI_Controller
                     INDEX `idx_calls_receiver` (`receiver_id`),
                     INDEX `idx_calls_status` (`status`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+            } else {
+                try {
+                    $this->db->query("ALTER TABLE `calls` MODIFY COLUMN `status` ENUM('ringing', 'accepted', 'rejected', 'missed', 'ended', 'busy', 'cancelled') NOT NULL DEFAULT 'ringing'");
+                } catch (\Throwable $e) {}
             }
 
             // 5. Ensure call_signals table exists for WebRTC ICE candidates
@@ -3358,6 +3625,9 @@ class Api extends CI_Controller
 
             $url = 'https://fcm.googleapis.com/v1/projects/' . self::FCM_PROJECT_ID . '/messages:send';
 
+            $is_call = isset($string_data['type']) && $string_data['type'] === 'incoming_call';
+            $channel_id = $is_call ? 'incoming_calls' : 'chat_messages';
+
             foreach ($tokens as $t) {
                 $fcm_token = $t['fcm_token'];
                 $payload = [
@@ -3371,7 +3641,7 @@ class Api extends CI_Controller
                         'android'      => [
                             'priority'     => 'HIGH',
                             'notification' => [
-                                'channel_id'              => 'chat_messages',
+                                'channel_id'              => $channel_id,
                                 'sound'                   => 'default',
                                 'default_sound'           => true,
                                 'default_vibrate_timings' => true,
@@ -3454,6 +3724,9 @@ class Api extends CI_Controller
 
             $url = 'https://fcm.googleapis.com/v1/projects/' . self::FCM_PROJECT_ID . '/messages:send';
 
+            $is_call = isset($string_data['type']) && $string_data['type'] === 'incoming_call';
+            $channel_id = $is_call ? 'incoming_calls' : 'chat_messages';
+
             foreach ($tokens as $t) {
                 $fcm_token = $t['fcm_token'];
                 $payload = [
@@ -3467,7 +3740,7 @@ class Api extends CI_Controller
                         'android'      => [
                             'priority'     => 'HIGH',
                             'notification' => [
-                                'channel_id'              => 'chat_messages',
+                                'channel_id'              => $channel_id,
                                 'sound'                   => 'default',
                                 'default_sound'           => true,
                                 'default_vibrate_timings' => true,

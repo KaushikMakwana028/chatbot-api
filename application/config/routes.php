@@ -93,6 +93,7 @@ $route['api/add_group_members']    = 'api/add_group_members';
 $route['api/approve_group_member'] = 'api/approve_group_member';
 $route['api/update_member_role']   = 'api/update_member_role';
 $route['api/remove_group_member']  = 'api/remove_group_member';
+$route['api/update_group']         = 'api/update_group';
 $route['api/mark_group_read']      = 'api/mark_group_read';
 
 // 1-to-1 WebRTC Calling Routes
